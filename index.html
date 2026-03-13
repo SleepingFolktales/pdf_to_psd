@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF → PSD Converter</title>
+<style>
+:root {
+  --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
+  --border:#2d2d36; --border2:#3d3d4a;
+  --text:#e4e4ec; --text2:#8888a0; --text3:#555568;
+  --accent:#6c8fff; --accent-dim:rgba(108,143,255,0.12); --accent-hover:#889fff;
+  --green:#4ebe8a; --green-dim:rgba(78,190,138,0.12);
+  --amber:#f0a840; --amber-dim:rgba(240,168,64,0.12);
+  --red:#e05858; --red-dim:rgba(224,88,88,0.12);
+  --purple:#b07cff; --purple-dim:rgba(176,124,255,0.10);
+  --r-sm:6px; --r:10px; --r-lg:14px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Inter',sans-serif;font-size:14px;line-height:1.5;min-height:100vh;display:flex;flex-direction:column;align-items:center}
+
+/* ── Site header ── */
+.site-header{width:100%;border-bottom:1px solid var(--border);background:var(--bg1);padding:10px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-shrink:0}
+.sh-brand{display:flex;align-items:center;gap:10px}
+.sh-logo{width:30px;height:30px;background:linear-gradient(135deg,#5b7fff,#b07cff);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;flex-shrink:0}
+.sh-name{font-size:13px;font-weight:600;color:var(--text)}
+.sh-sub{font-size:11px;color:var(--text3);margin-top:1px}
+.sh-email{font-size:11px;color:var(--text3);text-decoration:none;transition:color .12s}
+.sh-email:hover{color:var(--accent)}
+
+/* ── Main wrap ── */
+.main{width:100%;max-width:620px;padding:36px 16px 80px;display:flex;flex-direction:column;gap:14px}
+.page-title{text-align:center;padding-bottom:4px}
+.page-title h1{font-size:22px;font-weight:600;letter-spacing:-.4px;margin-bottom:5px;background:linear-gradient(135deg,#a0b8ff,#e4b8ff);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.page-title p{color:var(--text2);font-size:13px}
+
+/* ── Cards ── */
+.card{background:var(--bg1);border:1px solid var(--border);border-radius:var(--r-lg);padding:18px 20px}
+.section-label{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.7px;font-weight:600;margin-bottom:14px}
+.divider{height:1px;background:var(--border);margin:4px 0}
+
+/* ── Drop zone ── */
+#drop-zone{border:1.5px dashed var(--border2);border-radius:var(--r-lg);padding:44px 24px;text-align:center;cursor:pointer;transition:border-color .15s,background .15s;background:var(--bg1);position:relative}
+#drop-zone:hover,#drop-zone.drag-over{border-color:var(--accent);background:var(--accent-dim)}
+#drop-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+.drop-icon{width:44px;height:44px;background:var(--bg3);border:1px solid var(--border2);border-radius:11px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center;font-size:20px}
+#drop-zone h3{font-size:14px;font-weight:500;margin-bottom:4px}
+#drop-zone p{color:var(--text2);font-size:12px}
+.browse-link{color:var(--accent);cursor:pointer}
+
+/* ── File bar ── */
+.file-bar{display:flex;align-items:center;gap:12px;padding:11px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r)}
+.fb-icon{width:34px;height:34px;background:var(--accent-dim);border:1px solid rgba(108,143,255,.2);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.fb-info{flex:1;overflow:hidden}
+.fb-name{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fb-meta{font-size:11px;color:var(--text2);margin-top:1px}
+
+/* ── Options ── */
+.options-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+.opt-group{display:flex;flex-direction:column;gap:7px}
+.opt-label{font-size:11px;color:var(--text2);font-weight:500}
+.seg{display:flex;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:2px;gap:2px}
+.seg button{flex:1;padding:5px 0;border:none;background:transparent;color:var(--text2);border-radius:4px;cursor:pointer;font-size:11px;font-weight:500;transition:all .12s}
+.seg button.on{background:var(--accent);color:#fff}
+.text-input{background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:var(--r-sm);font-size:12px;width:100%;font-family:inherit;transition:border-color .1s}
+.text-input:focus{outline:none;border-color:var(--accent)}
+.text-input::placeholder{color:var(--text3)}
+.toggles{display:flex;flex-direction:column;gap:10px}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.tr-label{font-size:13px}.tr-sub{font-size:11px;color:var(--text2)}
+.toggle{position:relative;width:36px;height:20px;flex-shrink:0}
+.toggle input{display:none}
+.toggle-track{position:absolute;inset:0;background:var(--bg4);border:1px solid var(--border2);border-radius:10px;cursor:pointer;transition:all .18s}
+.toggle-track::after{content:'';position:absolute;width:14px;height:14px;background:var(--text3);border-radius:50%;top:2px;left:2px;transition:all .18s}
+.toggle input:checked+.toggle-track{background:var(--accent);border-color:var(--accent)}
+.toggle input:checked+.toggle-track::after{transform:translateX(16px);background:#fff}
+
+/* ── Buttons ── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:8px 16px;border-radius:var(--r-sm);border:none;cursor:pointer;font-size:13px;font-weight:500;font-family:inherit;transition:all .12s;white-space:nowrap}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:var(--accent-hover)}
+.btn-primary:disabled{opacity:.35;cursor:not-allowed}
+.btn-ghost{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}
+.btn-ghost:hover{border-color:var(--border2);color:var(--text)}
+.btn-sm{padding:4px 11px;font-size:11px}
+.btn-full{width:100%;padding:11px;font-size:14px}
+
+/* ── Progress ── */
+.prog-track{height:3px;background:var(--bg3);border-radius:2px;overflow:hidden;margin-bottom:10px}
+.prog-fill{height:100%;background:var(--accent);border-radius:2px;transition:width .25s ease;width:0%}
+.prog-status{font-size:12px;color:var(--text2);margin-bottom:10px}
+.log-console{background:var(--bg0);border:1px solid var(--border);border-radius:var(--r-sm);padding:8px 12px;font-family:'SF Mono','Fira Code','Cascadia Code',monospace;font-size:11px;max-height:140px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;scrollbar-width:thin;scrollbar-color:var(--border2) transparent}
+.log-line{color:var(--text2)}.log-ok{color:var(--green)}.log-warn{color:var(--amber)}.log-err{color:var(--red)}
+
+/* ── Notices ── */
+.notice{display:flex;gap:10px;align-items:flex-start;padding:10px 13px;border-radius:var(--r-sm);font-size:12px;line-height:1.6}
+.notice-amber{background:var(--amber-dim);border:1px solid rgba(240,168,64,.25);color:var(--amber)}
+.notice-green{background:var(--green-dim);border:1px solid rgba(78,190,138,.25);color:var(--green)}
+.n-icon{font-size:13px;margin-top:1px;flex-shrink:0}
+
+/* ── Downloads ── */
+.dl-list{display:flex;flex-direction:column;gap:8px}
+.dl-item{display:flex;align-items:center;gap:12px;padding:10px 13px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--r-sm)}
+.dl-info{flex:1;overflow:hidden}
+.dl-name{font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dl-meta{font-size:11px;color:var(--text2);margin-top:2px}
+.tag{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;letter-spacing:.3px;background:var(--accent-dim);color:var(--accent);border:1px solid rgba(108,143,255,.2)}
+
+/* ── Limitations panel ── */
+.lim-header{display:flex;align-items:center;justify-content:space-between;cursor:pointer;-webkit-user-select:none;user-select:none}
+.lim-header-label{font-size:12px;color:var(--text2);font-weight:500}
+.lim-chevron{font-size:11px;color:var(--text3);transition:transform .2s;display:inline-block}
+.lim-chevron.open{transform:rotate(180deg)}
+.lim-body{overflow:hidden;max-height:0;transition:max-height .3s ease}
+.lim-body.open{max-height:1000px}
+.lim-inner{padding-top:16px}
+.lim-section-title{font-size:10px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin:12px 0 6px}
+.lim-section-title:first-child{margin-top:0}
+.lim-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.lim-item{display:flex;align-items:flex-start;gap:7px;font-size:11px;color:var(--text2);line-height:1.5}
+.lim-dot{width:5px;height:5px;border-radius:50%;margin-top:5px;flex-shrink:0}
+.lim-ok{background:var(--green)}.lim-warn{background:var(--amber)}.lim-err{background:var(--red)}
+
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+
+<!-- ── Site Header ─────────────────────────────────────────────────────────── -->
+<div class="site-header">
+  <div class="sh-brand">
+    <div class="sh-logo">RA</div>
+    <div>
+      <div class="sh-name">Razi Ashary</div>
+      <div class="sh-sub">AIRS Foundry</div>
+    </div>
+  </div>
+  <a class="sh-email" href="mailto:razi@airsfoundry.com">razi@airsfoundry.com</a>
+</div>
+
+<!-- ── Main ────────────────────────────────────────────────────────────────── -->
+<div class="main">
+
+  <div class="page-title">
+    <h1>PDF → PSD Converter</h1>
+    <p>Convert PDFs from Canva, Figma or InDesign into layered Photoshop files with editable text</p>
+  </div>
+
+  <div id="lib-status" style="text-align:center;font-size:12px;color:var(--text2);padding:2px 0">Loading libraries…</div>
+
+  <!-- Drop Zone -->
+  <div id="drop-zone">
+    <input type="file" id="file-input" accept=".pdf" title="Choose a PDF file to convert">
+    <div class="drop-icon">📄</div>
+    <h3>Drop your PDF here</h3>
+    <p>or <span class="browse-link">browse to choose a file</span></p>
+  </div>
+
+  <!-- File Bar -->
+  <div id="file-bar" class="file-bar hidden">
+    <div class="fb-icon">📄</div>
+    <div class="fb-info">
+      <div class="fb-name" id="fb-name">—</div>
+      <div class="fb-meta" id="fb-meta">—</div>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="resetAll()">Change</button>
+  </div>
+
+  <!-- Options Card -->
+  <div id="options-card" class="card hidden">
+    <div class="section-label">Conversion Options</div>
+    <div class="options-row">
+      <div class="opt-group">
+        <div class="opt-label">Output Resolution</div>
+        <div class="seg" id="dpi-seg">
+          <button onclick="setDpi(72)">72 dpi</button>
+          <button onclick="setDpi(144)" class="on">144 dpi</button>
+          <button onclick="setDpi(216)">216 dpi</button>
+        </div>
+      </div>
+      <div class="opt-group">
+        <div class="opt-label">Page Range</div>
+        <input class="text-input" id="page-range" type="text" placeholder="e.g. 1-3 or all" value="all">
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div class="toggles" style="margin-top:14px">
+      <div class="toggle-row">
+        <div>
+          <div class="tr-label">Remove text from background layer</div>
+          <div class="tr-sub">Paints over each text item with the page background color — keeps layer opaque</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="opt-erase"><span class="toggle-track"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="tr-label">Sample text colors</div>
+          <div class="tr-sub">Detects fill color per text item from the rendered canvas</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="opt-colors" checked><span class="toggle-track"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="tr-label">Merge adjacent text blocks</div>
+          <div class="tr-sub">Groups nearby same-column items into fewer TypeLayers</div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="opt-merge" checked><span class="toggle-track"></span></label>
+      </div>
+    </div>
+  </div>
+
+  <!-- ag-psd Limitations Panel -->
+  <div id="lim-card" class="card hidden">
+    <div class="lim-header" onclick="toggleLim()">
+      <span class="lim-header-label">⚙ Current Known Limitations</span>
+      <span class="lim-chevron" id="lim-chevron">▾</span>
+    </div>
+    <div class="lim-body" id="lim-body">
+      <div class="lim-inner">
+        <div class="lim-section-title">✓ Fully supported</div>
+        <div class="lim-grid">
+          <div class="lim-item"><div class="lim-dot lim-ok"></div>RGB color mode (8-bit)</div>
+          <div class="lim-item"><div class="lim-dot lim-ok"></div>Writing pixel/image layers</div>
+          <div class="lim-item"><div class="lim-dot lim-ok"></div>Writing text (TypeLayers)</div>
+          <div class="lim-item"><div class="lim-dot lim-ok"></div>Layer groups, order &amp; names</div>
+          <div class="lim-item"><div class="lim-dot lim-ok"></div>Layer opacity &amp; blending</div>
+          <div class="lim-item"><div class="lim-dot lim-ok"></div>Horizontal text orientation</div>
+        </div>
+        <div class="lim-section-title">⚠ Requires action on open in Photoshop</div>
+        <div class="lim-grid">
+          <div class="lim-item"><div class="lim-dot lim-warn"></div>Text bitmap not pre-rendered — click <strong>Update</strong> on the prompt PS shows on open</div>
+          <div class="lim-item"><div class="lim-dot lim-warn"></div>Composite image not generated — PS rebuilds on first save</div>
+          <div class="lim-item"><div class="lim-dot lim-warn"></div>Predefined Paragraph / Character Styles not written — apply manually in PS</div>
+          <div class="lim-item"><div class="lim-dot lim-warn"></div>Blending option changes need manual re-save in PS to update bitmap data</div>
+        </div>
+        <div class="lim-section-title">✗ Not supported by ag-psd</div>
+        <div class="lim-grid">
+          <div class="lim-item"><div class="lim-dot lim-err"></div>CMYK, LAB, Indexed, Duotone, Multichannel color modes</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>16-bit or 32-bit channels</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Large Document Format (.psb)</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Color palettes</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Patterns &amp; Pattern Overlay effects</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Frame / timeline animations</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>3D layer effects</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Vertical text orientation (causes corrupt PSD)</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Some smart object filter types</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Some latest-PS metadata fields</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Photoshop Notice -->
+  <div id="ps-notice" class="notice notice-amber hidden">
+    <span class="n-icon">⚠</span>
+    <span>When opening the PSD in Photoshop, click <strong>Update</strong> on the prompt that appears. This rebuilds text layer bitmaps from the editable text data — expected behavior for any externally-generated PSD.</span>
+  </div>
+
+  <!-- Convert Button -->
+  <button id="convert-btn" class="btn btn-primary btn-full hidden" onclick="startConversion()">
+    ⚡ Convert to PSD
+  </button>
+
+  <!-- Progress Card -->
+  <div id="progress-card" class="card hidden">
+    <div class="section-label">Processing</div>
+    <div class="prog-track"><div class="prog-fill" id="prog-bar"></div></div>
+    <div class="prog-status" id="prog-status">Initializing…</div>
+    <div class="log-console" id="log-console"></div>
+  </div>
+
+  <!-- Downloads Card -->
+  <div id="dl-card" class="card hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <div class="section-label" style="margin:0">Ready to Download</div>
+      <span class="tag" id="dl-count-tag">0 files</span>
+    </div>
+    <div class="notice notice-green" style="margin-bottom:12px">
+      <span class="n-icon">✓</span>
+      <span id="dl-success-msg">Conversion complete.</span>
+    </div>
+    <div class="dl-list" id="dl-list"></div>
+    <div id="dl-all-wrap" class="hidden" style="margin-top:10px">
+      <button class="btn btn-ghost btn-full" onclick="downloadAll()">↓ Download All Pages</button>
+    </div>
+  </div>
+
+</div><!-- /.main -->
+
+<!-- ── CDN Libraries ────────────────────────────────────────────────────────── -->
+<script>
+'use strict';
+
+const LIBS = [
+  { name:'PDF.js',   urls:['https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js','https://unpkg.com/pdfjs-dist@3.11.174/build/pdf.min.js'], check:()=>typeof pdfjsLib!=='undefined' },
+  { name:'ag-psd',   urls:['https://cdn.jsdelivr.net/npm/ag-psd@30.1.0/dist/bundle.js','https://unpkg.com/ag-psd@30.1.0/dist/bundle.js'],                check:()=>typeof agPsd!=='undefined' },
+  { name:'FileSaver', urls:['https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js','https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js'], check:()=>typeof saveAs!=='undefined' },
+];
+
+function loadScript(url){
+  return new Promise((res,rej)=>{ const s=document.createElement('script'); s.src=url; s.onload=res; s.onerror=rej; document.head.appendChild(s); });
+}
+async function loadLib(lib){
+  for(const url of lib.urls){ try{ await loadScript(url); if(lib.check()) return; }catch{} }
+  if(!lib.check()) throw new Error('Failed to load '+lib.name);
+}
+async function loadAllLibs(){
+  const st=document.getElementById('lib-status');
+  for(const lib of LIBS){
+    st.textContent='Loading '+lib.name+'…';
+    try{ await loadLib(lib); }
+    catch(err){
+      st.textContent='⚠ '+err.message+' — Refresh or check your internet connection.';
+      st.style.color='var(--red)';
+      const dz=document.getElementById('drop-zone');
+      dz.style.opacity='.4'; dz.style.pointerEvents='none';
+      throw err;
+    }
+  }
+  st.remove();
+  pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+  agPsd.initializeCanvas((w,h)=>Object.assign(document.createElement('canvas'),{width:w,height:h}));
+  initApp();
+}
+loadAllLibs().catch(()=>{});
+
+// ─── App (runs only after all libraries confirmed loaded) ─────────────────────
+function initApp(){
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  let pdfFile=null, pdfDoc=null, selDpi=144, converting=false, psdResults=[];
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const $=id=>document.getElementById(id);
+  const show=id=>$(id).classList.remove('hidden');
+  const hide=id=>$(id).classList.add('hidden');
+
+  function log(msg,type=''){
+    const el=$('log-console'), d=document.createElement('div');
+    d.className='log-line'+(type?' log-'+type:'');
+    d.textContent=msg;
+    el.appendChild(d);
+    el.scrollTop=el.scrollHeight;
+  }
+  function setProgress(pct,status){
+    $('prog-bar').style.width=Math.min(100,pct)+'%';
+    $('prog-status').textContent=status;
+  }
+  function fmtBytes(n){ return n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(1)+' MB'; }
+
+  // ── Expose globals for HTML onclick attrs ──────────────────────────────────
+  window.resetAll=resetAll;
+  window.startConversion=startConversion;
+  window.setDpi=setDpi;
+  window.downloadAll=downloadAll;
+  window.toggleLim=toggleLim;
+
+  // ── Drag & drop ────────────────────────────────────────────────────────────
+  const dz=$('drop-zone');
+  dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag-over');});
+  dz.addEventListener('dragleave',()=>dz.classList.remove('drag-over'));
+  dz.addEventListener('drop',e=>{
+    e.preventDefault(); dz.classList.remove('drag-over');
+    const f=e.dataTransfer.files[0];
+    if(f&&f.type==='application/pdf') loadPdf(f);
+    else alert('Please drop a PDF file.');
+  });
+  $('file-input').addEventListener('change',e=>{ if(e.target.files[0]) loadPdf(e.target.files[0]); });
+
+  // ── DPI selector ──────────────────────────────────────────────────────────
+  function setDpi(val){
+    selDpi=val;
+    document.querySelectorAll('#dpi-seg button').forEach(b=>b.classList.toggle('on',b.textContent.startsWith(String(val))));
+  }
+
+  // ── Limitations panel toggle ───────────────────────────────────────────────
+  function toggleLim(){
+    $('lim-body').classList.toggle('open');
+    $('lim-chevron').classList.toggle('open');
+  }
+
+  // ── Load PDF ───────────────────────────────────────────────────────────────
+  async function loadPdf(file){
+    pdfFile=file;
+    try{
+      const buf=await file.arrayBuffer();
+      pdfDoc=await pdfjsLib.getDocument({data:new Uint8Array(buf)}).promise;
+      const n=pdfDoc.numPages;
+      $('fb-name').textContent=file.name;
+      $('fb-meta').textContent=n+' page'+(n!==1?'s':'')+' · '+fmtBytes(file.size);
+      $('page-range').value=n>1?'1-'+n:'1';
+      hide('drop-zone'); show('file-bar'); show('options-card');
+      show('lim-card'); show('ps-notice'); show('convert-btn');
+      hide('progress-card'); hide('dl-card');
+      $('log-console').innerHTML=''; $('dl-list').innerHTML=''; psdResults=[];
+    }catch(err){ alert('Could not load PDF: '+(err.message||err)); resetAll(); }
+  }
+
+  function resetAll(){
+    pdfFile=pdfDoc=null; $('file-input').value=''; psdResults=[];
+    show('drop-zone'); hide('file-bar'); hide('options-card');
+    hide('lim-card'); hide('ps-notice'); hide('convert-btn');
+    hide('progress-card'); hide('dl-card');
+  }
+
+  // ── Page range parser ──────────────────────────────────────────────────────
+  function parseRange(str,total){
+    str=str.trim().toLowerCase();
+    if(!str||str==='all') return Array.from({length:total},(_,i)=>i+1);
+    const set=new Set();
+    str.split(',').forEach(chunk=>{
+      chunk=chunk.trim();
+      if(chunk.includes('-')){ const[a,b]=chunk.split('-').map(Number); for(let i=Math.max(1,a);i<=Math.min(total,b);i++) set.add(i); }
+      else{ const n=parseInt(chunk,10); if(n>=1&&n<=total) set.add(n); }
+    });
+    return [...set].sort((a,b)=>a-b);
+  }
+
+  // ── Font name normaliser ───────────────────────────────────────────────────
+  const FONT_MAP={
+    'arial':'ArialMT','arial bold':'Arial-BoldMT','arial italic':'Arial-ItalicMT',
+    'arial bold italic':'Arial-BoldItalicMT','helvetica':'Helvetica','helvetica bold':'Helvetica-Bold',
+    'helvetica neue':'HelveticaNeue','times new roman':'TimesNewRomanPSMT',
+    'times new roman bold':'TimesNewRomanPS-BoldMT','courier new':'CourierNewPSMT',
+    'courier new bold':'CourierNewPS-BoldMT','georgia':'Georgia','verdana':'Verdana',
+  };
+  function normFont(raw){
+    if(!raw) return 'ArialMT';
+    const stripped=raw.includes('+')?raw.split('+').pop():raw;
+    const lower=stripped.toLowerCase().replace(/[_\s]+/g,' ').trim();
+    return FONT_MAP[lower]||stripped;
+  }
+
+  // ── Viewport coordinate converter ─────────────────────────────────────────
+  function toCanvas(viewport,px,py){
+    if(typeof viewport.convertToViewportPoint==='function') return viewport.convertToViewportPoint(px,py);
+    const[a,b,c,d,e,f]=viewport.transform;
+    return[a*px+c*py+e, b*px+d*py+f];
+  }
+
+  // ── Page background color sampler ─────────────────────────────────────────
+  // Reads pixels from the four corners + edges of the canvas and returns the
+  // most common near-white/light color — that's almost always the page bg.
+  // Falls back to white (255,255,255) if nothing is found.
+  function samplePageBackground(ctx, w, h){
+    const probes = [];
+    // Sample 8×8 patches from each corner
+    const patches = [
+      [0, 0], [w-8, 0], [0, h-8], [w-8, h-8],
+      [Math.floor(w/2)-4, 0], [0, Math.floor(h/2)-4],
+    ];
+    for(const [px, py] of patches){
+      try{
+        const {data} = ctx.getImageData(Math.max(0,px), Math.max(0,py), 8, 8);
+        for(let i=0; i<data.length; i+=4){
+          if(data[i+3] < 200) continue;
+          probes.push([data[i], data[i+1], data[i+2]]);
+        }
+      }catch{}
+    }
+    if(!probes.length) return {r:255, g:255, b:255};
+    // Average the light (luma > 180) pixels — those are background
+    let sr=0, sg=0, sb=0, cnt=0;
+    for(const [r,g,b] of probes){
+      const luma = r*.299 + g*.587 + b*.114;
+      if(luma > 180){ sr+=r; sg+=g; sb+=b; cnt++; }
+    }
+    if(!cnt) return {r:255, g:255, b:255};
+    return { r:Math.round(sr/cnt), g:Math.round(sg/cnt), b:Math.round(sb/cnt) };
+  }
+
+  // ── Per-item color sampler ─────────────────────────────────────────────────
+  // Samples the most common non-white, non-transparent pixel color in the box.
+  function sampleColor(ctx,x,y,w,h){
+    const sx=Math.max(0,Math.round(x)), sy=Math.max(0,Math.round(y));
+    const sw=Math.min(Math.round(w),ctx.canvas.width-sx);
+    const sh=Math.min(Math.round(h),ctx.canvas.height-sy);
+    if(sw<=0||sh<=0) return{r:0,g:0,b:0};
+    try{
+      const{data}=ctx.getImageData(sx,sy,sw,sh);
+      const buckets=new Map();
+      for(let i=0;i<data.length;i+=4){
+        if(data[i+3]<160) continue; // skip transparent
+        const r=data[i]&0xf8, g=data[i+1]&0xf8, b=data[i+2]&0xf8;
+        const key=(r<<16)|(g<<8)|b;
+        buckets.set(key,(buckets.get(key)||0)+1);
+      }
+      if(!buckets.size) return{r:0,g:0,b:0};
+      const sorted=[...buckets.entries()].sort((a,b)=>b[1]-a[1]);
+      // Pick most-frequent color that isn't near-white
+      for(const[key]of sorted.slice(0,12)){
+        const r=(key>>16)&0xff, g=(key>>8)&0xff, b=key&0xff;
+        const luma=r*.299+g*.587+b*.114;
+        const sat=Math.max(r,g,b)-Math.min(r,g,b);
+        if(luma<200||sat>30) return{r,g,b};
+      }
+      // Fallback: darkest bucket
+      let dk={r:0,g:0,b:0}, dkL=999;
+      for(const[key]of sorted){
+        const r=(key>>16)&0xff, g=(key>>8)&0xff, b=key&0xff;
+        const l=r*.299+g*.587+b*.114;
+        if(l<dkL){dkL=l;dk={r,g,b};}
+      }
+      return dk;
+    }catch{return{r:0,g:0,b:0};}
+  }
+
+  // ── Text block merger ──────────────────────────────────────────────────────
+  //
+  // Only used for determining TypeLayer groupings.
+  // Background erasure happens per raw item, NOT per merged-block bbox —
+  // that was the root cause of the left-column-wipeout bug.
+  //
+  // Merge is conservative: same-column guard (width < 45% canvas, height < 30% canvas).
+  function mergeBlocks(items, canvasW, canvasH){
+    if(!items.length) return[];
+    const maxW=canvasW*.45, maxH=canvasH*.30;
+    const sorted=[...items].sort((a,b)=>(a.y-b.y)||(a.x-b.x));
+    const used=new Uint8Array(sorted.length);
+    const blocks=[];
+
+    for(let i=0;i<sorted.length;i++){
+      if(used[i]) continue;
+      const seed=sorted[i];
+      const group=[i]; used[i]=1;
+      let mnX=seed.x, mnY=seed.y, mxX=seed.x+seed.width, mxY=seed.y+seed.height;
+      const fh=seed.height; // seed font height — thresholds based on this
+
+      let changed=true;
+      while(changed){
+        changed=false;
+        for(let j=0;j<sorted.length;j++){
+          if(used[j]) continue;
+          const it=sorted[j];
+          // ① Same line: y-band within 55% font height, x adjacent (≤ 2× fh gap)
+          const sameLine=Math.abs(it.y-mnY)<fh*.55 && it.x>=mnX-fh*.5 && it.x<=mxX+fh*2.0;
+          // ② Next line: x-aligned to group left (within 60% fh), vertical gap ≤ 1.8×fh
+          const gapY=it.y-mxY;
+          const nextLine=Math.abs(it.x-mnX)<fh*.60 && gapY>=-(fh*.3) && gapY<=fh*1.8;
+          if(!sameLine&&!nextLine) continue;
+          // Block-size guards (prevent cross-column merges)
+          const nW=Math.max(mxX,it.x+it.width)-Math.min(mnX,it.x);
+          const nH=Math.max(mxY,it.y+it.height)-Math.min(mnY,it.y);
+          if(nW>maxW||nH>maxH) continue;
+          group.push(j); used[j]=1;
+          mnX=Math.min(mnX,it.x); mnY=Math.min(mnY,it.y);
+          mxX=Math.max(mxX,it.x+it.width); mxY=Math.max(mxY,it.y+it.height);
+          changed=true;
+        }
+      }
+
+      const gItems=group.map(k=>sorted[k]);
+      gItems.sort((a,b)=>{ const dy=a.y-b.y; return Math.abs(dy)>fh*.4?dy:a.x-b.x; });
+
+      let text='', prevY=null;
+      for(const it of gItems){
+        if(prevY!==null&&Math.abs(it.y-prevY)>fh*.4) text+='\n';
+        text+=it.str; prevY=it.y;
+      }
+
+      blocks.push({ text, bx:gItems[0].bx, by:gItems[0].by, fontName:gItems[0].fontName, fontSize:gItems[0].fontSize, color:gItems[0].color });
+    }
+    return blocks;
+  }
+
+  // ── Main conversion ────────────────────────────────────────────────────────
+  async function startConversion(){
+    if(!pdfDoc||converting) return;
+    converting=true; $('convert-btn').disabled=true;
+    psdResults=[]; $('log-console').innerHTML=''; $('dl-list').innerHTML='';
+    show('progress-card'); hide('dl-card');
+
+    const scale=selDpi/72;
+    const doErase=$('opt-erase').checked;
+    const doColors=$('opt-colors').checked;
+    const doMerge=$('opt-merge').checked;
+    const pages=parseRange($('page-range').value,pdfDoc.numPages);
+
+    if(!pages.length){
+      alert('No valid pages in that range.');
+      converting=false; $('convert-btn').disabled=false; return;
+    }
+
+    log('Starting: '+pages.length+' page(s) @ '+selDpi+' DPI (scale ×'+scale+')');
+
+    for(let pi=0;pi<pages.length;pi++){
+      const pageNum=pages[pi];
+      setProgress((pi/pages.length)*90,'Page '+pageNum+' of '+pdfDoc.numPages+' — rendering…');
+      try{
+
+        // ── 1. Render page ─────────────────────────────────────────────────
+        log('Page '+pageNum+': rendering…');
+        const page=await pdfDoc.getPage(pageNum);
+        const vp=page.getViewport({scale});
+        const bgCanvas=document.createElement('canvas');
+        bgCanvas.width=Math.round(vp.width); bgCanvas.height=Math.round(vp.height);
+        const bgCtx=bgCanvas.getContext('2d',{willReadFrequently:true});
+        await page.render({canvasContext:bgCtx,viewport:vp}).promise;
+        log('Page '+pageNum+': rendered '+bgCanvas.width+'×'+bgCanvas.height+' px','ok');
+
+        // ── 2. Extract text items ──────────────────────────────────────────
+        log('Page '+pageNum+': extracting text…');
+        const tc=await page.getTextContent();
+        const rawItems=[];
+
+        for(const item of tc.items){
+          if(!item.str||!item.str.trim()) continue;
+          const[bx,by]=toCanvas(vp,item.transform[4],item.transform[5]);
+          // Font height: prefer item.height (PDF user-space), else |transform[3]|
+          const pdfH=item.height>0?item.height:Math.abs(item.transform[3]);
+          const fontSize=pdfH*scale;
+          if(fontSize<0.5) continue;
+          const itemW=Math.max((item.width||0)*scale, fontSize*.4);
+          const styleRec=tc.styles?.[item.fontName];
+          const fontName=normFont(styleRec?styleRec.fontFamily:item.fontName);
+          // Use cap-height (72%) so erase box doesn't extend too far above glyphs
+          const capH=fontSize*.72;
+          rawItems.push({
+            str:item.str,
+            bx, by,
+            x:bx, y:by-capH,
+            width:itemW, height:capH,
+            fontName, fontSize,
+            color:{r:0,g:0,b:0},
+          });
+        }
+        log('Page '+pageNum+': '+rawItems.length+' text item(s) found');
+
+        if(!rawItems.length){
+          log('Page '+pageNum+': no text found — saving background-only layer','warn');
+          const psd={width:bgCanvas.width,height:bgCanvas.height,children:[{name:'Background',top:0,left:0,bottom:bgCanvas.height,right:bgCanvas.width,canvas:bgCanvas}]};
+          const buf=agPsd.writePsd(psd,{noBackground:true});
+          const blob=new Blob([buf],{type:'application/octet-stream'});
+          const base=pdfFile.name.replace(/\.pdf$/i,'');
+          const fn=pages.length===1?base+'.psd':base+'_p'+pageNum+'.psd';
+          psdResults.push({filename:fn,blob,pageNum,sizeMB:(blob.size/1048576).toFixed(2),textCount:0});
+          continue;
+        }
+
+        // ── 3. Sample colors BEFORE erasing ────────────────────────────────
+        if(doColors){
+          for(const it of rawItems) it.color=sampleColor(bgCtx,it.x,it.y,it.width,it.height);
+          log('Page '+pageNum+': colors sampled');
+        }
+
+        // ── 4. Paint over each text item with the page background color ────────
+        // ⚠ FIX 1: per-rawItem, NOT per-merged-block bbox (old bug wiped columns).
+        // ⚠ FIX 2: fillRect with sampled background color instead of clearRect.
+        //    clearRect leaves transparent holes → checkerboard in Photoshop.
+        //    We sample the page background from the four corners and use that
+        //    color to paint over each text glyph run, keeping the layer opaque.
+        if(doErase){
+          // Sample background from corners — pick the most common near-white color
+          const pageBg = samplePageBackground(bgCtx, bgCanvas.width, bgCanvas.height);
+          bgCtx.fillStyle = `rgb(${pageBg.r},${pageBg.g},${pageBg.b})`;
+          for(const it of rawItems){
+            bgCtx.fillRect(
+              Math.floor(it.x)-1,
+              Math.floor(it.y)-1,
+              Math.ceil(it.width)+2,
+              Math.ceil(it.height)+2
+            );
+          }
+          log('Page '+pageNum+': '+rawItems.length+' item(s) painted over (bg: rgb('+pageBg.r+','+pageBg.g+','+pageBg.b+'))');
+        }
+
+        // ── 5. Merge into TypeLayer blocks (for layer count only) ───────────
+        let blocks;
+        if(doMerge){
+          blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
+          log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
+        }else{
+          blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,fontName:it.fontName,fontSize:it.fontSize,color:it.color}));
+          log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
+        }
+
+        // ── 6. Assemble PSD ────────────────────────────────────────────────
+        setProgress(((pi+.85)/pages.length)*90,'Page '+pageNum+' — writing PSD…');
+
+        const textLayers=blocks.map((b,idx)=>({
+          name:'T'+(idx+1)+': '+b.text.replace(/\n/g,' ').slice(0,30),
+          text:{
+            text:b.text,
+            transform:[1,0,0,1,b.bx,b.by],
+            style:{ font:{name:b.fontName}, fontSize:b.fontSize, fillColor:b.color },
+          },
+        }));
+
+        const bgLayer={name:'Background',top:0,left:0,bottom:bgCanvas.height,right:bgCanvas.width,canvas:bgCanvas};
+        const psd={
+          width:bgCanvas.width, height:bgCanvas.height,
+          children:[...textLayers,bgLayer], // text layers on top
+        };
+
+        const buf=agPsd.writePsd(psd,{invalidateTextLayers:true,generateThumbnail:false,noBackground:true});
+        const blob=new Blob([buf],{type:'application/octet-stream'});
+        const base=pdfFile.name.replace(/\.pdf$/i,'');
+        const fn=pages.length===1?base+'.psd':base+'_p'+pageNum+'.psd';
+        const sizeMB=(blob.size/1048576).toFixed(2);
+
+        psdResults.push({filename:fn,blob,pageNum,sizeMB,textCount:blocks.length});
+        log('Page '+pageNum+': ✓ '+sizeMB+' MB — '+blocks.length+' text layer(s)','ok');
+
+      }catch(err){
+        log('Page '+pageNum+': ERROR — '+err.message,'err');
+        console.error('Conversion error p'+pageNum,err);
+      }
+    }
+
+    setProgress(100,'Done — '+psdResults.length+' file(s) ready');
+    if(psdResults.length) buildDownloadUI();
+    else log('No pages converted successfully.','err');
+    converting=false; $('convert-btn').disabled=false;
+  }
+
+  // ── Download UI ────────────────────────────────────────────────────────────
+  function buildDownloadUI(){
+    const list=$('dl-list'); list.innerHTML='';
+    psdResults.forEach(r=>{
+      const item=document.createElement('div'); item.className='dl-item';
+      item.innerHTML='<div class="dl-info"><div class="dl-name">'+r.filename+'</div><div class="dl-meta">'+r.sizeMB+' MB · '+r.textCount+' text layer'+(r.textCount!==1?'s':'')+'</div></div>';
+      const btn=document.createElement('button'); btn.className='btn btn-primary btn-sm'; btn.textContent='↓ Download';
+      btn.onclick=()=>saveAs(r.blob,r.filename); item.appendChild(btn); list.appendChild(item);
+    });
+    $('dl-count-tag').textContent=psdResults.length+' file'+(psdResults.length!==1?'s':'');
+    $('dl-success-msg').textContent=psdResults.length+' PSD file'+(psdResults.length!==1?'s':'')+' ready. Open in Photoshop and click Update when prompted.';
+    if(psdResults.length>1) show('dl-all-wrap'); else hide('dl-all-wrap');
+    show('dl-card');
+  }
+
+  function downloadAll(){ psdResults.forEach((r,i)=>setTimeout(()=>saveAs(r.blob,r.filename),i*350)); }
+
+} // end initApp()
+</script>
+</body>
+</html>
