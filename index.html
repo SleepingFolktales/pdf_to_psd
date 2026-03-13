@@ -188,9 +188,9 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
       <div class="toggle-row">
         <div>
           <div class="tr-label">Remove text from background layer</div>
-          <div class="tr-sub">Paints over each text item with the page background color — keeps layer opaque</div>
+          <div class="tr-sub">Samples local surrounding color per text item and paints over it — handles colored backgrounds</div>
         </div>
-        <label class="toggle"><input type="checkbox" id="opt-erase"><span class="toggle-track"></span></label>
+        <label class="toggle"><input type="checkbox" id="opt-erase" checked><span class="toggle-track"></span></label>
       </div>
       <div class="toggle-row">
         <div>
@@ -226,6 +226,7 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
           <div class="lim-item"><div class="lim-dot lim-ok"></div>Layer opacity &amp; blending</div>
           <div class="lim-item"><div class="lim-dot lim-ok"></div>Horizontal text orientation</div>
           <div class="lim-item"><div class="lim-dot lim-ok"></div>Vertical text — rendered via rotation transform</div>
+          <div class="lim-item"><div class="lim-dot lim-ok"></div>Embedded images extracted as separate layers</div>
         </div>
         <div class="lim-section-title">⚠ Requires action on open in Photoshop</div>
         <div class="lim-grid">
@@ -503,6 +504,38 @@ function initApp(){
     return { r:Math.round(sr/cnt), g:Math.round(sg/cnt), b:Math.round(sb/cnt) };
   }
 
+  // ── Per-item LOCAL background sampler ──────────────────────────────────────
+  // For each text item, samples a strip above and below the bounding box to
+  // discover the local background color.  This handles colored sections,
+  // gradient fills, and non-white page designs much better than the old
+  // corner-based page-wide sampler.
+  function sampleLocalBg(ctx,x,y,w,h,cw,ch){
+    const pad=8; // 8 px strips above and below
+    const buckets=new Map();
+    function addRegion(sx,sy,sw,sh){
+      sx=Math.max(0,Math.floor(sx)); sy=Math.max(0,Math.floor(sy));
+      sw=Math.min(Math.ceil(sw),cw-sx); sh=Math.min(Math.ceil(sh),ch-sy);
+      if(sw<=0||sh<=0) return;
+      try{
+        const d=ctx.getImageData(sx,sy,sw,sh);
+        for(let i=0;i<d.data.length;i+=8){ // sample every 2nd pixel
+          if(d.data[i+3]<200) continue;
+          const r=d.data[i]&0xf8, g=d.data[i+1]&0xf8, b=d.data[i+2]&0xf8;
+          const key=(r<<16)|(g<<8)|b;
+          buckets.set(key,(buckets.get(key)||0)+1);
+        }
+      }catch{}
+    }
+    // Sample above and below (more reliable than left/right for horizontal text)
+    addRegion(x-4,y-pad,w+8,pad);
+    addRegion(x-4,y+h,w+8,pad);
+    if(!buckets.size) return{r:255,g:255,b:255};
+    // Most-frequent color = true background (even if some text bleeds into strips)
+    let maxCnt=0,maxKey=0;
+    for(const[key,cnt] of buckets){ if(cnt>maxCnt){maxCnt=cnt;maxKey=key;} }
+    return{ r:(maxKey>>16)&0xff, g:(maxKey>>8)&0xff, b:maxKey&0xff };
+  }
+
   // ── Per-item color sampler ─────────────────────────────────────────────────
   // Samples the most common non-white, non-transparent pixel color in the box.
   function sampleColor(ctx,x,y,w,h){
@@ -566,11 +599,13 @@ function initApp(){
         for(let j=0;j<sorted.length;j++){
           if(used[j]) continue;
           const it=sorted[j];
-          // ① Same line: y-band within 55% font height, x adjacent (≤ 2× fh gap)
-          const sameLine=Math.abs(it.y-mnY)<fh*.55 && it.x>=mnX-fh*.5 && it.x<=mxX+fh*2.0;
-          // ② Next line: x-aligned to group left (within 60% fh), vertical gap ≤ 1.8×fh
+          // ① Same line: y-band within 65% font height, x adjacent (≤ 4× fh gap)
+          //    Wider x-gap catches spaced words in the same sentence
+          const sameLine=Math.abs(it.y-mnY)<fh*.65 && it.x>=mnX-fh*.5 && it.x<=mxX+fh*4.0;
+          // ② Next line: x-aligned to group left (within 120% fh), vertical gap ≤ 2.5×fh
+          //    Relaxed x-align catches indented paragraphs; larger gap catches loose leading
           const gapY=it.y-mxY;
-          const nextLine=Math.abs(it.x-mnX)<fh*.60 && gapY>=-(fh*.3) && gapY<=fh*1.8;
+          const nextLine=Math.abs(it.x-mnX)<fh*1.2 && gapY>=-(fh*.3) && gapY<=fh*2.5;
           if(!sameLine&&!nextLine) continue;
           // ③ Never merge items with different rotation — keep vertical text separate
           if(!!it.isRotated!==!!seed.isRotated) continue;
@@ -597,6 +632,47 @@ function initApp(){
       blocks.push({ text, bx:gItems[0].bx, by:gItems[0].by, fontName:gItems[0].fontName, fontSize:gItems[0].fontSize, color:gItems[0].color, isRotated:gItems[0].isRotated, cosA:gItems[0].cosA, sinA:gItems[0].sinA });
     }
     return blocks;
+  }
+
+  // ── Image extraction (walks PDF operator list, tracks CTM) ─────────────────
+  // Returns an array of {name, left, top, right, bottom, width, height}
+  // for every embedded image on the page (photos, logos, decorations).
+  // Tiny images (< 30 px) and full-page fills (> 90 % of canvas) are skipped.
+  async function extractPageImages(page, vp, canvasW, canvasH){
+    const ops=await page.getOperatorList();
+    const vpT=vp.transform;
+    const results=[];
+    const ctmStack=[];
+    let ctm=[1,0,0,1,0,0];
+    // 2-D affine matrix multiply  M × N
+    function mul(m,n){
+      return[
+        m[0]*n[0]+m[2]*n[1], m[1]*n[0]+m[3]*n[1],
+        m[0]*n[2]+m[2]*n[3], m[1]*n[2]+m[3]*n[3],
+        m[0]*n[4]+m[2]*n[5]+m[4], m[1]*n[4]+m[3]*n[5]+m[5],
+      ];
+    }
+    for(let i=0;i<ops.fnArray.length;i++){
+      const fn=ops.fnArray[i], args=ops.argsArray[i];
+      if(fn===pdfjsLib.OPS.save){ ctmStack.push([...ctm]); }
+      else if(fn===pdfjsLib.OPS.restore){ if(ctmStack.length) ctm=ctmStack.pop(); }
+      else if(fn===pdfjsLib.OPS.transform){ ctm=mul(ctm,args); }
+      else if(fn===pdfjsLib.OPS.paintImageXObject||fn===pdfjsLib.OPS.paintJpegXObject){
+        // Image occupies the unit square [0,1]×[0,1] under the current CTM.
+        // Map the four corners through viewport × CTM to get canvas pixels.
+        const fc=mul(vpT,ctm);
+        const corners=[[0,0],[1,0],[0,1],[1,1]].map(([x,y])=>[fc[0]*x+fc[2]*y+fc[4],fc[1]*x+fc[3]*y+fc[5]]);
+        const xs=corners.map(c=>c[0]), ys=corners.map(c=>c[1]);
+        const left=Math.floor(Math.min(...xs)), top=Math.floor(Math.min(...ys));
+        const right=Math.ceil(Math.max(...xs)), bottom=Math.ceil(Math.max(...ys));
+        const w=right-left, h=bottom-top;
+        // Skip tiny and full-page images
+        if(w>=30&&h>=30&&w*h<canvasW*canvasH*.9){
+          results.push({name:args[0],left,top,right,bottom,width:w,height:h});
+        }
+      }
+    }
+    return results;
   }
 
   // ── Main conversion ────────────────────────────────────────────────────────
@@ -707,17 +783,15 @@ function initApp(){
           log('Page '+pageNum+': colors sampled');
         }
 
-        // ── 4. Paint over each text item with the page background color ────────
-        // ⚠ FIX 1: per-rawItem, NOT per-merged-block bbox (old bug wiped columns).
-        // ⚠ FIX 2: fillRect with sampled background color instead of clearRect.
-        //    clearRect leaves transparent holes → checkerboard in Photoshop.
-        //    We sample the page background from the four corners and use that
-        //    color to paint over each text glyph run, keeping the layer opaque.
+        // ── 4. Paint over each text item with its LOCAL background color ────────
+        // Per-item local sampling: reads a strip above & below each glyph run to
+        // find the true background color at that spot.  Handles colored sections,
+        // dark bands, and gradient fills correctly — much better than the old
+        // single-color page-wide approach.
         if(doErase){
-          // Sample background from corners — pick the most common near-white color
-          const pageBg = samplePageBackground(bgCtx, bgCanvas.width, bgCanvas.height);
-          bgCtx.fillStyle = `rgb(${pageBg.r},${pageBg.g},${pageBg.b})`;
           for(const it of rawItems){
+            const bg=sampleLocalBg(bgCtx,it.x,it.y,it.width,it.height,bgCanvas.width,bgCanvas.height);
+            bgCtx.fillStyle=`rgb(${bg.r},${bg.g},${bg.b})`;
             bgCtx.fillRect(
               Math.floor(it.x)-1,
               Math.floor(it.y)-1,
@@ -725,7 +799,7 @@ function initApp(){
               Math.ceil(it.height)+2
             );
           }
-          log('Page '+pageNum+': '+rawItems.length+' item(s) painted over (bg: rgb('+pageBg.r+','+pageBg.g+','+pageBg.b+'))');
+          log('Page '+pageNum+': '+rawItems.length+' text item(s) erased (per-item local bg)');
         }
 
         // ── 5. Merge into TypeLayer blocks (for layer count only) ───────────
@@ -738,7 +812,25 @@ function initApp(){
           log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
         }
 
-        // ── 6. Assemble PSD ────────────────────────────────────────────────
+        // ── 6. Extract embedded images as separate layers ──────────────────
+        setProgress(((pi+.7)/pages.length)*90,'Page '+pageNum+' — extracting images…');
+        const extractedImgs=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height);
+        const imgLayers=[];
+        for(let k=0;k<extractedImgs.length;k++){
+          const img=extractedImgs[k];
+          // Clamp to canvas bounds
+          const cl=Math.max(0,img.left), ct=Math.max(0,img.top);
+          const cr=Math.min(bgCanvas.width,img.right), cb=Math.min(bgCanvas.height,img.bottom);
+          const cw=cr-cl, ch=cb-ct;
+          if(cw<=0||ch<=0) continue;
+          const c=document.createElement('canvas');
+          c.width=cw; c.height=ch;
+          c.getContext('2d').drawImage(bgCanvas,cl,ct,cw,ch,0,0,cw,ch);
+          imgLayers.push({name:'IMG '+(k+1)+' ('+cw+'×'+ch+')',top:ct,left:cl,bottom:cb,right:cr,canvas:c});
+        }
+        if(imgLayers.length) log('Page '+pageNum+': '+imgLayers.length+' image layer(s) extracted','ok');
+
+        // ── 7. Assemble PSD ────────────────────────────────────────────────
         setProgress(((pi+.85)/pages.length)*90,'Page '+pageNum+' — writing PSD…');
 
         const textLayers=blocks.map((b,idx)=>({
@@ -755,10 +847,11 @@ function initApp(){
           },
         }));
 
+        // Layer order (top→bottom): text → images → background
         const bgLayer={name:'Background',top:0,left:0,bottom:bgCanvas.height,right:bgCanvas.width,canvas:bgCanvas};
         const psd={
           width:bgCanvas.width, height:bgCanvas.height,
-          children:[...textLayers,bgLayer], // text layers on top
+          children:[...textLayers,...imgLayers,bgLayer],
         };
 
         const buf=agPsd.writePsd(psd,{invalidateTextLayers:true,generateThumbnail:false,noBackground:true});
@@ -767,8 +860,8 @@ function initApp(){
         const fn=pages.length===1?base+'.psd':base+'_p'+pageNum+'.psd';
         const sizeMB=(blob.size/1048576).toFixed(2);
 
-        psdResults.push({filename:fn,blob,pageNum,sizeMB,textCount:blocks.length});
-        log('Page '+pageNum+': ✓ '+sizeMB+' MB — '+blocks.length+' text layer(s)','ok');
+        psdResults.push({filename:fn,blob,pageNum,sizeMB,textCount:blocks.length,imgCount:imgLayers.length});
+        log('Page '+pageNum+': ✓ '+sizeMB+' MB — '+blocks.length+' text + '+imgLayers.length+' image layer(s)','ok');
 
       }catch(err){
         log('Page '+pageNum+': ERROR — '+err.message,'err');
@@ -787,7 +880,8 @@ function initApp(){
     const list=$('dl-list'); list.innerHTML='';
     psdResults.forEach(r=>{
       const item=document.createElement('div'); item.className='dl-item';
-      item.innerHTML='<div class="dl-info"><div class="dl-name">'+r.filename+'</div><div class="dl-meta">'+r.sizeMB+' MB · '+r.textCount+' text layer'+(r.textCount!==1?'s':'')+'</div></div>';
+      const imgNote=r.imgCount?' + '+r.imgCount+' image':'';
+      item.innerHTML='<div class="dl-info"><div class="dl-name">'+r.filename+'</div><div class="dl-meta">'+r.sizeMB+' MB · '+r.textCount+' text'+imgNote+' layer'+(r.textCount+r.imgCount!==1?'s':'')+'</div></div>';
       const btn=document.createElement('button'); btn.className='btn btn-primary btn-sm'; btn.textContent='↓ Download';
       btn.onclick=()=>saveAs(r.blob,r.filename); item.appendChild(btn); list.appendChild(item);
     });
