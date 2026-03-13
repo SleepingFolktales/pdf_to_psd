@@ -121,6 +121,21 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
 .lim-dot{width:5px;height:5px;border-radius:50%;margin-top:5px;flex-shrink:0}
 .lim-ok{background:var(--green)}.lim-warn{background:var(--amber)}.lim-err{background:var(--red)}
 
+/* ── Debug log panel ── */
+.debug-header{display:flex;align-items:center;justify-content:space-between;margin-top:12px;margin-bottom:4px}
+.debug-label{font-size:10px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.btn-copy{padding:3px 10px;font-size:10px;background:var(--bg3);color:var(--text2);border:1px solid var(--border);border-radius:4px;cursor:pointer;transition:background .12s,color .12s}
+.btn-copy:hover{background:var(--bg4);color:var(--text)}
+.btn-copy.copied{background:var(--green-dim);color:var(--green);border-color:var(--green)}
+.debug-console{max-height:400px;overflow-y:auto;font-family:'Cascadia Code','Fira Code',monospace;font-size:11px;line-height:1.55;background:var(--bg0);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px 12px;margin-top:4px;white-space:pre-wrap;word-break:break-all;color:var(--text2)}
+.debug-console .dbg-section{color:var(--accent);font-weight:600;margin-top:6px}
+.debug-console .dbg-section:first-child{margin-top:0}
+.debug-console .dbg-ok{color:var(--green)}
+.debug-console .dbg-warn{color:var(--amber)}
+.debug-console .dbg-err{color:var(--red)}
+.debug-console .dbg-dim{color:var(--text3)}
+.debug-console .dbg-img{color:var(--purple)}
+
 .hidden{display:none!important}
 </style>
 </head>
@@ -190,21 +205,21 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
           <div class="tr-label">Clean up background (separate text & images)</div>
           <div class="tr-sub">Cuts text and image regions out of the background layer — the TypeLayers and image layers fill the gaps</div>
         </div>
-        <label class="toggle"><input type="checkbox" id="opt-erase" checked><span class="toggle-track"></span></label>
+        <label class="toggle"><input type="checkbox" id="opt-erase"><span class="toggle-track"></span></label>
       </div>
       <div class="toggle-row">
         <div>
           <div class="tr-label">Sample text colors</div>
           <div class="tr-sub">Detects fill color per text item from the rendered canvas</div>
         </div>
-        <label class="toggle"><input type="checkbox" id="opt-colors" checked><span class="toggle-track"></span></label>
+        <label class="toggle"><input type="checkbox" id="opt-colors"><span class="toggle-track"></span></label>
       </div>
       <div class="toggle-row">
         <div>
           <div class="tr-label">Merge adjacent text blocks</div>
           <div class="tr-sub">Groups nearby same-column items into fewer TypeLayers</div>
         </div>
-        <label class="toggle"><input type="checkbox" id="opt-merge" checked><span class="toggle-track"></span></label>
+        <label class="toggle"><input type="checkbox" id="opt-merge"><span class="toggle-track"></span></label>
       </div>
     </div>
   </div>
@@ -282,6 +297,11 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
     <div class="prog-track"><div class="prog-fill" id="prog-bar"></div></div>
     <div class="prog-status" id="prog-status">Initializing…</div>
     <div class="log-console" id="log-console"></div>
+    <div class="debug-header">
+      <span class="debug-label">Debug Log (detailed pipeline trace)</span>
+      <button class="btn-copy" id="btn-copy-debug" onclick="copyDebugLog()">Copy Debug Log</button>
+    </div>
+    <div class="debug-console" id="debug-console"></div>
   </div>
 
   <!-- Downloads Card -->
@@ -357,6 +377,32 @@ function initApp(){
     el.appendChild(d);
     el.scrollTop=el.scrollHeight;
   }
+
+  // ── Debug logger — detailed pipeline trace for diagnostics ────────────
+  const _debugLines=[];
+  function dbg(msg,cls=''){
+    _debugLines.push(msg);
+    const el=$('debug-console');
+    if(!el) return;
+    const d=document.createElement('div');
+    if(cls) d.className=cls;
+    d.textContent=msg;
+    el.appendChild(d);
+    el.scrollTop=el.scrollHeight;
+  }
+  function dbgClear(){
+    _debugLines.length=0;
+    const el=$('debug-console');
+    if(el) el.innerHTML='';
+  }
+  window.copyDebugLog=function(){
+    const text=_debugLines.join('\n');
+    navigator.clipboard.writeText(text).then(()=>{
+      const btn=$('btn-copy-debug');
+      btn.textContent='Copied!'; btn.classList.add('copied');
+      setTimeout(()=>{ btn.textContent='Copy Debug Log'; btn.classList.remove('copied'); },2000);
+    }).catch(()=>{ /* fallback: select all */ });
+  };
   function setProgress(pct,status){
     $('prog-bar').style.width=Math.min(100,pct)+'%';
     $('prog-status').textContent=status;
@@ -386,6 +432,7 @@ function initApp(){
   window.setDpi=setDpi;
   window.downloadAll=downloadAll;
   window.toggleLim=toggleLim;
+  // copyDebugLog already set on window above
 
   // ── Drag & drop ────────────────────────────────────────────────────────────
   const dz=$('drop-zone');
@@ -634,11 +681,167 @@ function initApp(){
     return blocks;
   }
 
+  // ── Comprehensive PDF metadata + operator trace logger ─────────────────────
+  async function logPdfMetadata(pdfDoc, selDpi, scale){
+    dbg('');
+    dbg('========================================================','dbg-section');
+    dbg('PDF DOCUMENT METADATA','dbg-section');
+    dbg('========================================================','dbg-section');
+    dbg('Total pages: '+pdfDoc.numPages);
+    try{
+      const meta=await pdfDoc.getMetadata();
+      if(meta.info){
+        const i=meta.info;
+        dbg('  Title: "'+(i.Title||'(none)')+'"');
+        dbg('  Author: "'+(i.Author||'(none)')+'"');
+        dbg('  Creator: "'+(i.Creator||'(none)')+'"');
+        dbg('  Producer: "'+(i.Producer||'(none)')+'"');
+        dbg('  CreationDate: "'+(i.CreationDate||'(none)')+'"');
+        dbg('  ModDate: "'+(i.ModDate||'(none)')+'"');
+        dbg('  PDFFormatVersion: "'+(i.PDFFormatVersion||'(none)')+'"');
+        dbg('  IsLinearized: '+(i.IsLinearized||false));
+        dbg('  IsAcroFormPresent: '+(i.IsAcroFormPresent||false));
+        dbg('  IsXFAPresent: '+(i.IsXFAPresent||false));
+        var knownKeys=['Title','Author','Creator','Producer','CreationDate','ModDate','PDFFormatVersion','IsLinearized','IsAcroFormPresent','IsXFAPresent','IsCollectionPresent','IsSignaturesPresent'];
+        var extraKeys=Object.keys(i).filter(function(k){return knownKeys.indexOf(k)<0;});
+        if(extraKeys.length){
+          dbg('  -- Additional metadata keys --');
+          for(var ei=0;ei<extraKeys.length;ei++) dbg('    '+extraKeys[ei]+': '+JSON.stringify(i[extraKeys[ei]]),'dbg-dim');
+        }
+      }
+    }catch(e){ dbg('  (metadata unavailable: '+e.message+')','dbg-dim'); }
+    dbg('========================================================','dbg-section');
+  }
+
+  function logPageProperties(page, pageNum, scale, selDpi){
+    dbg('');
+    dbg('========================================================','dbg-section');
+    dbg('PAGE '+pageNum+' RAW PROPERTIES','dbg-section');
+    dbg('========================================================','dbg-section');
+    var pgView=page.view;
+    var ptW=pgView[2]-pgView[0], ptH=pgView[3]-pgView[1];
+    dbg('  view (mediaBox): ['+pgView.join(', ')+']');
+    dbg('  Size in points: '+ptW.toFixed(1)+' x '+ptH.toFixed(1)+' pt');
+    dbg('  Size in inches: '+(ptW/72).toFixed(2)+' x '+(ptH/72).toFixed(2)+' in');
+    dbg('  Size in mm: '+(ptW/72*25.4).toFixed(1)+' x '+(ptH/72*25.4).toFixed(1)+' mm');
+    dbg('  Rotation: '+page.rotate+' deg');
+    dbg('  UserUnit: '+(page.userUnit||1));
+    dbg('  Scale: x'+scale+' ('+selDpi+' DPI)');
+    dbg('  Output canvas: '+Math.round(ptW*scale)+' x '+Math.round(ptH*scale)+' px');
+    dbg('========================================================','dbg-section');
+  }
+
+  function logOperatorTrace(ops, opsNames, pageNum, page){
+    dbg('');
+    dbg('========================================================','dbg-section');
+    dbg('FULL OPERATOR TRACE -- PAGE '+pageNum,'dbg-section');
+    dbg('========================================================','dbg-section');
+    var fillColor='?', strokeColor='?', currentFont='?', fontSize=0;
+    var ctmTrace=[1,0,0,1,0,0];
+    var depth=0;
+    for(var i=0;i<ops.fnArray.length;i++){
+      var fn=ops.fnArray[i], args=ops.argsArray[i];
+      var name=opsNames[fn]||('op_'+fn);
+      // Color state changes
+      if(name==='setFillRGBColor'){
+        fillColor='rgb('+Math.round(args[0]*255)+','+Math.round(args[1]*255)+','+Math.round(args[2]*255)+')';
+        dbg('  ['+i+'] '+name+': '+fillColor,'dbg-dim');
+      }else if(name==='setStrokeRGBColor'){
+        strokeColor='rgb('+Math.round(args[0]*255)+','+Math.round(args[1]*255)+','+Math.round(args[2]*255)+')';
+        dbg('  ['+i+'] '+name+': '+strokeColor,'dbg-dim');
+      }else if(name==='setFillGray'){
+        fillColor='gray('+Math.round(args[0]*255)+')';
+        dbg('  ['+i+'] '+name+': '+fillColor,'dbg-dim');
+      }else if(name==='setStrokeGray'){
+        strokeColor='gray('+Math.round(args[0]*255)+')';
+        dbg('  ['+i+'] '+name+': '+strokeColor,'dbg-dim');
+      }else if(name==='setFillCMYKColor'){
+        fillColor='cmyk('+args[0].toFixed(2)+','+args[1].toFixed(2)+','+args[2].toFixed(2)+','+args[3].toFixed(2)+')';
+        dbg('  ['+i+'] '+name+': '+fillColor,'dbg-warn');
+      }else if(name==='setStrokeCMYKColor'){
+        strokeColor='cmyk('+args[0].toFixed(2)+','+args[1].toFixed(2)+','+args[2].toFixed(2)+','+args[3].toFixed(2)+')';
+        dbg('  ['+i+'] '+name+': '+strokeColor,'dbg-warn');
+      // Transform state
+      }else if(name==='save'){
+        depth++;
+        dbg('  ['+i+'] SAVE (depth='+depth+')','dbg-dim');
+      }else if(name==='restore'){
+        depth--;
+        dbg('  ['+i+'] RESTORE (depth='+depth+')','dbg-dim');
+      }else if(name==='transform'){
+        dbg('  ['+i+'] TRANSFORM: ['+args.map(function(v){return v.toFixed(3);}).join(', ')+']','dbg-dim');
+      // Font/text state
+      }else if(name==='setFont'){
+        currentFont=args[0]; fontSize=args[1];
+        dbg('  ['+i+'] SET FONT: "'+currentFont+'" size='+fontSize,'dbg-dim');
+      }else if(name==='showText'||name==='showSpacedText'){
+        var textPreview='';
+        if(Array.isArray(args[0])){
+          for(var ti=0;ti<args[0].length;ti++){
+            var item=args[0][ti];
+            if(typeof item==='string') textPreview+=item;
+          }
+        }else if(typeof args[0]==='string'){ textPreview=args[0]; }
+        dbg('  ['+i+'] '+name+': "'+textPreview.slice(0,60)+'" font='+currentFont+' size='+fontSize+' fill='+fillColor,'dbg-dim');
+      }else if(name==='beginText'){
+        dbg('  ['+i+'] BEGIN TEXT','dbg-dim');
+      }else if(name==='endText'){
+        dbg('  ['+i+'] END TEXT','dbg-dim');
+      }else if(name==='moveText'){
+        dbg('  ['+i+'] MOVE TEXT: dx='+args[0].toFixed(2)+' dy='+args[1].toFixed(2),'dbg-dim');
+      }else if(name==='setTextMatrix'){
+        dbg('  ['+i+'] SET TEXT MATRIX: ['+args.map(function(v){return v.toFixed(3);}).join(', ')+']','dbg-dim');
+      // Image operations
+      }else if(name==='paintImageXObject'||name==='paintJpegXObject'){
+        var imgId=args[0];
+        dbg('  ['+i+'] '+name+': "'+imgId+'" fill='+fillColor+' stroke='+strokeColor,'dbg-img');
+        // Try to get image object details
+        try{
+          var imgObj=page.objs.get(imgId);
+          if(imgObj){
+            dbg('    Native size: '+(imgObj.width||'?')+'x'+(imgObj.height||'?')+' px','dbg-img');
+            if(imgObj.data) dbg('    Data length: '+imgObj.data.length+' bytes','dbg-dim');
+          }
+        }catch(e){}
+      }else if(name==='paintInlineImageXObject'){
+        var inlineImg=args[0];
+        if(inlineImg){
+          dbg('  ['+i+'] '+name+': native='+(inlineImg.width||'?')+'x'+(inlineImg.height||'?')+' px','dbg-img');
+        }else{
+          dbg('  ['+i+'] '+name,'dbg-img');
+        }
+      }else if(name==='paintImageXObjectRepeat'){
+        dbg('  ['+i+'] '+name+': "'+args[0]+'" scaleX='+args[1]+' scaleY='+args[2]+' repeats='+((args.length-3)/2),'dbg-img');
+      // Path operations
+      }else if(name==='constructPath'){
+        var pathOps=args[0]||[], pathArgs=args[1]||[];
+        var pathNames=Object.entries(pdfjsLib.OPS).reduce(function(m,e){m[e[1]]=e[0];return m;},{});
+        var pathDesc=pathOps.map(function(op){return pathNames[op]||('op'+op);}).join(', ');
+        dbg('  ['+i+'] CONSTRUCT PATH: ['+pathDesc+'] ('+pathArgs.length+' coords)','dbg-dim');
+      }else if(name==='fill'||name==='stroke'||name==='fillStroke'||name==='eoFill'||name==='eoFillStroke'){
+        dbg('  ['+i+'] '+name.toUpperCase()+' fill='+fillColor+' stroke='+strokeColor,'dbg-dim');
+      }else if(name==='setGState'){
+        var gs=args[0]||[];
+        var gsDesc=gs.map(function(pair){return pair[0]+'='+JSON.stringify(pair[1]);}).join(', ');
+        dbg('  ['+i+'] SET GSTATE: ['+gsDesc.slice(0,120)+']','dbg-dim');
+      }else if(name==='setLineWidth'){
+        dbg('  ['+i+'] SET LINE WIDTH: '+args[0],'dbg-dim');
+      }else if(name==='beginMarkedContentProps'||name==='beginMarkedContent'){
+        dbg('  ['+i+'] '+name+': tag="'+args[0]+'"'+(args[1]?' props='+JSON.stringify(args[1]).slice(0,80):''),'dbg-dim');
+      }else if(name==='endMarkedContent'){
+        dbg('  ['+i+'] '+name,'dbg-dim');
+      }else if(name==='clip'||name==='eoClip'){
+        dbg('  ['+i+'] '+name.toUpperCase(),'dbg-dim');
+      }
+    }
+    dbg('========================================================','dbg-section');
+  }
+
   // ── Image extraction (walks PDF operator list, tracks CTM) ─────────────────
   // Returns an array of {name, left, top, right, bottom, width, height}
   // for every embedded image on the page (photos, logos, decorations).
   // Tiny images (< 30 px) and full-page fills (> 90 % of canvas) are skipped.
-  async function extractPageImages(page, vp, canvasW, canvasH){
+  async function extractPageImages(page, vp, canvasW, canvasH, pageNum){
     const ops=await page.getOperatorList();
     const vpT=vp.transform;
     const results=[];
@@ -652,12 +855,68 @@ function initApp(){
         m[0]*n[4]+m[2]*n[5]+m[4], m[1]*n[4]+m[3]*n[5]+m[5],
       ];
     }
+
+    // ── Debug: count operators by type ──
+    const opCounts={};
+    const opsNames=Object.entries(pdfjsLib.OPS).reduce((m,[k,v])=>{ m[v]=k; return m; },{});
+    for(let i=0;i<ops.fnArray.length;i++){
+      const name=opsNames[ops.fnArray[i]]||('op_'+ops.fnArray[i]);
+      opCounts[name]=(opCounts[name]||0)+1;
+    }
+    dbg(`════════════════════════════════════════════════════════`,'dbg-section');
+    dbg(`RAW OPERATOR LIST — PAGE ${pageNum}`,'dbg-section');
+    dbg(`════════════════════════════════════════════════════════`,'dbg-section');
+    dbg(`Total operators: ${ops.fnArray.length}`);
+    dbg(``);
+    dbg(`── Image Paint Operators ──`);
+    const imgOps=['paintImageXObject','paintJpegXObject','paintInlineImageXObject','paintImageXObjectRepeat'];
+    for(const name of imgOps){
+      dbg(`  ${name}: ${opCounts[name]||0}${opCounts[name]?' ✓':''}`,(opCounts[name]?'dbg-ok':'dbg-dim'));
+    }
+    dbg(``);
+    dbg(`── Vector Draw Operators ──`);
+    const vectorOps=['fill','stroke','eoFill','fillStroke','eoFillStroke','moveTo','lineTo','curveTo','rectangle','closePath'];
+    let vecTotal=0;
+    for(const v of vectorOps) vecTotal+=(opCounts[v]||0);
+    dbg(`  Total: ${vecTotal}`);
+    for(const v of vectorOps){
+      if(opCounts[v]) dbg(`    ${v}: ${opCounts[v]}`,'dbg-dim');
+    }
+    dbg(``);
+    dbg(`── Transformation Operators ──`);
+    dbg(`  save/restore: ${opCounts['save']||0}/${opCounts['restore']||0}`);
+    dbg(`  transform: ${opCounts['transform']||0}`);
+    dbg(``);
+    dbg(`── Text Operators ──`);
+    const textOps=['showText','showSpacedText','nextLine','setFont','beginText','endText'];
+    for(const name of textOps){
+      if(opCounts[name]) dbg(`  ${name}: ${opCounts[name]}`,'dbg-dim');
+    }
+    dbg(``);
+    dbg(`── Color/Graphics State ──`);
+    const gfxOps=['setFillRGBColor','setStrokeRGBColor','setFillGray','setStrokeGray','setFillCMYKColor','setStrokeCMYKColor','setLineWidth','setLineCap','setLineJoin','setDash'];
+    for(const name of gfxOps){
+      if(opCounts[name]) dbg(`  ${name}: ${opCounts[name]}`,'dbg-dim');
+    }
+    dbg(``);
+    dbg(`── Top 10 Most Frequent ──`);
+    const topOps=Object.entries(opCounts).sort((a,b)=>b[1]-a[1]).slice(0,10);
+    for(const [name,count] of topOps){
+      dbg(`  ${name}: ${count}`,'dbg-dim');
+    }
+    dbg(`════════════════════════════════════════════════════════`,'dbg-section');
+    dbg(``);
+
+    logOperatorTrace(ops, opsNames, pageNum, page);
+
+    let skippedTiny=0, skippedFullPage=0;
+
     for(let i=0;i<ops.fnArray.length;i++){
       const fn=ops.fnArray[i], args=ops.argsArray[i];
       if(fn===pdfjsLib.OPS.save){ ctmStack.push([...ctm]); }
       else if(fn===pdfjsLib.OPS.restore){ if(ctmStack.length) ctm=ctmStack.pop(); }
       else if(fn===pdfjsLib.OPS.transform){ ctm=mul(ctm,args); }
-      else if(fn===pdfjsLib.OPS.paintImageXObject||fn===pdfjsLib.OPS.paintJpegXObject){
+      else if(fn===pdfjsLib.OPS.paintImageXObject||fn===pdfjsLib.OPS.paintJpegXObject||fn===pdfjsLib.OPS.paintInlineImageXObject){
         // Image occupies the unit square [0,1]×[0,1] under the current CTM.
         // Map the four corners through viewport × CTM to get canvas pixels.
         const fc=mul(vpT,ctm);
@@ -667,11 +926,49 @@ function initApp(){
         const right=Math.ceil(Math.max(...xs)), bottom=Math.ceil(Math.max(...ys));
         const w=right-left, h=bottom-top;
         // Skip tiny and full-page images
-        if(w>=30&&h>=30&&w*h<canvasW*canvasH*.9){
-          results.push({name:args[0],left,top,right,bottom,width:w,height:h});
+        const opName=opsNames[fn]||'unknown';
+        if(w<30||h<30){
+          skippedTiny++;
+          dbg(`  SKIP tiny ${opName}: ${w}×${h} at (${left},${top})`,'dbg-dim');
+        }else if(w*h>=canvasW*canvasH*.9){
+          skippedFullPage++;
+          dbg(`  SKIP full-page ${opName}: ${w}×${h} covers ${((w*h)/(canvasW*canvasH)*100).toFixed(0)}%`,'dbg-warn');
+        }else{
+          const imgName=fn===pdfjsLib.OPS.paintInlineImageXObject?'inline_'+i:args[0];
+          results.push({name:imgName,left,top,right,bottom,width:w,height:h});
+          dbg(`  FOUND ${opName}: "${imgName}" ${w}×${h} at (${left},${top})→(${right},${bottom})`,'dbg-img');
+        }
+      }
+      else if(fn===pdfjsLib.OPS.paintImageXObjectRepeat){
+        // Repeated/tiled images: args = [imgName, scaleX, scaleY, x1,y1, x2,y2, ...]
+        const imgName=args[0], sx=args[1], sy=args[2];
+        const repeatCount=(args.length-3)/2;
+        dbg(`  paintImageXObjectRepeat: "${imgName}" with ${repeatCount} repeat(s)`,'dbg-img');
+        for(let p=3;p<args.length;p+=2){
+          const tx=args[p], ty=args[p+1];
+          const localCtm=[sx,0,0,sy,tx,ty];
+          const combined=mul(ctm,localCtm);
+          const fc=mul(vpT,combined);
+          const corners=[[0,0],[1,0],[0,1],[1,1]].map(([x,y])=>[fc[0]*x+fc[2]*y+fc[4],fc[1]*x+fc[3]*y+fc[5]]);
+          const xs=corners.map(c=>c[0]), ys=corners.map(c=>c[1]);
+          const left=Math.floor(Math.min(...xs)), top=Math.floor(Math.min(...ys));
+          const right=Math.ceil(Math.max(...xs)), bottom=Math.ceil(Math.max(...ys));
+          const w=right-left, h=bottom-top;
+          if(w<30||h<30){
+            skippedTiny++;
+          }else if(w*h>=canvasW*canvasH*.9){
+            skippedFullPage++;
+          }else{
+            results.push({name:imgName+'_rep'+p,left,top,right,bottom,width:w,height:h});
+            dbg(`    repeat #${(p-3)/2+1}: ${w}×${h} at (${left},${top})`,'dbg-img');
+          }
         }
       }
     }
+    dbg(`── IMAGE EXTRACTION SUMMARY ──`,'dbg-section');
+    dbg(`  Found: ${results.length} image(s)`,(results.length?'dbg-ok':'dbg-warn'));
+    dbg(`  Skipped tiny (<30px): ${skippedTiny}`,'dbg-dim');
+    dbg(`  Skipped full-page (>90%): ${skippedFullPage}`,'dbg-dim');
     return results;
   }
 
@@ -694,6 +991,15 @@ function initApp(){
     }
 
     log('Starting: '+pages.length+' page(s) @ '+selDpi+' DPI (scale ×'+scale+')');
+    dbgClear();
+    dbg(`════════════════════════════════════════`,'dbg-section');
+    dbg(`PDF→PSD CONVERSION DEBUG LOG`,'dbg-section');
+    dbg(`════════════════════════════════════════`,'dbg-section');
+    dbg(`Pages: ${pages.join(', ')} | DPI: ${selDpi} | Scale: ${scale}`);
+    dbg(`Options: erase=${doErase}, colors=${doColors}, merge=${doMerge}`);
+    dbg(`File: ${pdfFile.name} (${fmtBytes(pdfFile.size)})`);
+
+    await logPdfMetadata(pdfDoc, selDpi, scale);
 
     for(let pi=0;pi<pages.length;pi++){
       const pageNum=pages[pi];
@@ -703,6 +1009,7 @@ function initApp(){
         // ── 1. Render page ─────────────────────────────────────────────────
         log('Page '+pageNum+': rendering…');
         const page=await pdfDoc.getPage(pageNum);
+        logPageProperties(page, pageNum, scale, selDpi);
         // Canvas size guard:
         //   MAX_PX  = 15,000 px — safe for all modern browsers and well under PSD 30k limit
         //   PSD_PX  = 30,000 px — hard PSD format cap; Photoshop rejects files beyond this
@@ -729,6 +1036,33 @@ function initApp(){
         // ── 2. Extract text items ──────────────────────────────────────────
         log('Page '+pageNum+': extracting text…');
         const tc=await page.getTextContent();
+
+        // ── Debug: RAW PDF.js text data (BEFORE any filtering) ──
+        dbg(`════════════════════════════════════════════════════════`,'dbg-section');
+        dbg(`RAW PDF.js DATA — PAGE ${pageNum}`,'dbg-section');
+        dbg(`════════════════════════════════════════════════════════`,'dbg-section');
+        dbg(`Total text items: ${tc.items.length}`);
+        dbg(`Styles dictionary keys: ${Object.keys(tc.styles||{}).length}`);
+        if(tc.styles && Object.keys(tc.styles).length>0){
+          dbg(`  Styles:`);
+          for(const [key,val] of Object.entries(tc.styles)){
+            dbg(`    "${key}": family="${val.fontFamily||'?'}" ascent=${val.ascent} descent=${val.descent} vertical=${val.vertical||false}`,'dbg-dim');
+          }
+        }
+        dbg(``);
+        dbg(`── ALL TEXT ITEMS (including empty/whitespace) ──`);
+        for(let i=0;i<tc.items.length;i++){
+          const item=tc.items[i];
+          const preview=item.str?(item.str.length>50?item.str.slice(0,50)+'…':item.str):'(empty)';
+          const isEmpty=!item.str||!item.str.trim();
+          dbg(`  [${i}] "${preview}" ${isEmpty?'[EMPTY]':''}`,'dbg-dim');
+          dbg(`      fontName: "${item.fontName}" | width: ${item.width?.toFixed(2)||'?'} | height: ${item.height?.toFixed(2)||'?'}`,'dbg-dim');
+          dbg(`      transform: [${item.transform.map(v=>v.toFixed(3)).join(', ')}]`,'dbg-dim');
+          dbg(`      hasEOL: ${item.hasEOL||false} | dir: "${item.dir||'?'}"${item.chars?' | chars: '+item.chars.length:''}`,'dbg-dim');
+        }
+        dbg(`════════════════════════════════════════════════════════`,'dbg-section');
+        dbg(``);
+
         const rawItems=[];
 
         for(const item of tc.items){
@@ -741,8 +1075,9 @@ function initApp(){
           const itemW=Math.max((item.width||0)*scale, fontSize*.4);
           const styleRec=tc.styles?.[item.fontName];
           const fontName=normFont(styleRec?styleRec.fontFamily:item.fontName);
-          // Use cap-height (72%) so erase box doesn't extend too far above glyphs
-          const capH=fontSize*.72;
+          // Full font height with generous padding for ascenders/descenders
+          // 0.72 cap-height was too small — ascenders (d,f,h) and descenders (g,y,p) leaked through
+          const fullH=fontSize;
           // ── Rotation detection ──────────────────────────────────────────
           // Map the PDF text-direction vector (transform[0], transform[1]) through
           // the viewport matrix to get the canvas-space angle.  This correctly
@@ -754,17 +1089,34 @@ function initApp(){
           const angle=Math.atan2(cdY,cdX);
           const isRotated=Math.abs(angle)>Math.PI/12; // > 15°
           const cosA=cdX/tMag, sinA=cdY/tMag;
+          // Erase region: extend 25% above baseline (ascenders) and 35% below (descenders)
+          // Total erase height = fullH * 1.6 to cover the complete glyph bounding box
+          const eraseH=fullH*1.6;
+          const eraseY=by-fullH*1.25; // top of erase box: baseline minus 125% of font height
           rawItems.push({
             str:item.str,
             bx, by,
-            x:bx, y:by-capH,
-            width:itemW, height:capH,
+            x:bx, y:eraseY,
+            width:itemW, height:eraseH,
             fontName, fontSize,
             color:{r:0,g:0,b:0},
             isRotated, cosA, sinA,
           });
         }
         log('Page '+pageNum+': '+rawItems.length+' text item(s) found');
+
+        // ── Debug: text extraction details ──
+        dbg(`── PAGE ${pageNum} TEXT EXTRACTION ──`,'dbg-section');
+        dbg(`Canvas: ${bgCanvas.width}×${bgCanvas.height} px`);
+        dbg(`Viewport transform: [${vp.transform.map(v=>v.toFixed(2)).join(', ')}]`);
+        dbg(`Raw text items from PDF.js: ${tc.items.length} (${tc.items.filter(i=>!i.str||!i.str.trim()).length} empty/whitespace skipped)`);
+        dbg(`Valid text items: ${rawItems.length}`);
+        for(let ti=0;ti<Math.min(rawItems.length,50);ti++){
+          const it=rawItems[ti];
+          const rotTag=it.isRotated?` ROT(cos=${it.cosA.toFixed(2)},sin=${it.sinA.toFixed(2)})`:'';
+          dbg(`  T${ti+1}: "${it.str.slice(0,40)}" font=${it.fontName} size=${it.fontSize.toFixed(1)} pos=(${it.bx.toFixed(0)},${it.by.toFixed(0)}) erase=(${it.x.toFixed(0)},${it.y.toFixed(0)} ${it.width.toFixed(0)}×${it.height.toFixed(0)})${rotTag}`,'dbg-dim');
+        }
+        if(rawItems.length>50) dbg(`  ... and ${rawItems.length-50} more items`,'dbg-dim');
 
         if(!rawItems.length){
           log('Page '+pageNum+': no text found — saving background-only layer','warn');
@@ -782,6 +1134,11 @@ function initApp(){
         if(doColors){
           for(const it of rawItems) it.color=sampleColor(bgCtx,it.x,it.y,it.width,it.height);
           log('Page '+pageNum+': colors sampled');
+          dbg(`── PAGE ${pageNum} COLOR SAMPLING ──`,'dbg-section');
+          for(let ti=0;ti<Math.min(rawItems.length,20);ti++){
+            const it=rawItems[ti];
+            dbg(`  T${ti+1}: "${it.str.slice(0,30)}" → rgb(${it.color.r},${it.color.g},${it.color.b})`,'dbg-dim');
+          }
         }
 
         // ── 4. Extract embedded images from the PRISTINE render ──────────
@@ -789,7 +1146,7 @@ function initApp(){
         //    We copy each image's rectangle from the clean, unmodified render
         //    so the image layers have perfect pixels.
         setProgress(((pi+.55)/pages.length)*90,'Page '+pageNum+' — extracting images…');
-        const extractedImgs=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height);
+        const extractedImgs=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height,pageNum);
         const imgLayers=[];
         const seenBounds=[];
         for(let k=0;k<extractedImgs.length;k++){
@@ -808,7 +1165,14 @@ function initApp(){
           c.getContext('2d').drawImage(bgCanvas,cl,ct,cw,ch,0,0,cw,ch);
           imgLayers.push({name:'IMG '+(k+1)+' ('+cw+'×'+ch+')',top:ct,left:cl,bottom:cb,right:cr,canvas:c});
         }
+        dbg(`── PAGE ${pageNum} IMAGE LAYERS ──`,'dbg-section');
+        dbg(`  Raw candidates: ${extractedImgs.length}`);
+        dbg(`  After dedup/clamp: ${imgLayers.length}`,(imgLayers.length?'dbg-ok':'dbg-warn'));
+        for(const il of imgLayers){
+          dbg(`  ${il.name}: (${il.left},${il.top})→(${il.right},${il.bottom})`,'dbg-img');
+        }
         if(imgLayers.length) log('Page '+pageNum+': '+imgLayers.length+' image layer(s) extracted','ok');
+        else if(extractedImgs.length) log('Page '+pageNum+': '+extractedImgs.length+' image candidate(s) but all filtered out','warn');
 
         // ── 5. Clean up background — cut out text & image regions ─────────
         //    clearRect → transparent holes.  In the final PSD composite:
@@ -816,13 +1180,13 @@ function initApp(){
         //      • Image pixel-layers fill the image holes
         //      • Background shows only base design (shapes, borders, fills)
         if(doErase){
-          // Cut text regions (2 px padding around each glyph run)
+          // Cut text regions (4 px padding around each glyph run for clean edges)
           for(const it of rawItems){
             bgCtx.clearRect(
-              Math.floor(it.x)-2,
-              Math.floor(it.y)-2,
-              Math.ceil(it.width)+4,
-              Math.ceil(it.height)+4
+              Math.floor(it.x)-4,
+              Math.floor(it.y)-4,
+              Math.ceil(it.width)+8,
+              Math.ceil(it.height)+8
             );
           }
           // Cut image regions (they now live in their own layers)
@@ -830,6 +1194,17 @@ function initApp(){
             bgCtx.clearRect(il.left,il.top,il.right-il.left,il.bottom-il.top);
           }
           log('Page '+pageNum+': background cleaned — '+rawItems.length+' text + '+imgLayers.length+' image region(s) cut');
+          dbg(`── PAGE ${pageNum} BACKGROUND CLEANUP ──`,'dbg-section');
+          dbg(`  clearRect text regions: ${rawItems.length} (4px padding each)`);
+          if(rawItems.length>0){
+            const first=rawItems[0];
+            dbg(`    Example T1: clearRect(${Math.floor(first.x)-4}, ${Math.floor(first.y)-4}, ${Math.ceil(first.width)+8}, ${Math.ceil(first.height)+8})`,'dbg-dim');
+            dbg(`    Original pos: baseline=(${first.bx.toFixed(0)},${first.by.toFixed(0)}) fontSize=${first.fontSize.toFixed(1)} eraseH=${first.height.toFixed(1)}`,'dbg-dim');
+          }
+          dbg(`  clearRect image regions: ${imgLayers.length}`);
+          for(const il of imgLayers){
+            dbg(`    ${il.name}: clearRect(${il.left}, ${il.top}, ${il.right-il.left}, ${il.bottom-il.top})`,'dbg-dim');
+          }
         }
 
         // ── 6. Merge into TypeLayer blocks ───────────────────────────────
@@ -840,6 +1215,15 @@ function initApp(){
         }else{
           blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,fontName:it.fontName,fontSize:it.fontSize,color:it.color,isRotated:it.isRotated,cosA:it.cosA,sinA:it.sinA}));
           log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
+        }
+
+        // ── Debug: merged text blocks ──
+        dbg(`── PAGE ${pageNum} TEXT LAYERS (${doMerge?'merged':'unmerged'}) ──`,'dbg-section');
+        for(let bi=0;bi<blocks.length;bi++){
+          const b=blocks[bi];
+          const preview=b.text.replace(/\n/g,'\\n').slice(0,60);
+          const rotTag=b.isRotated?` ROT`:'';
+          dbg(`  T${bi+1}: "${preview}" font=${b.fontName} size=${b.fontSize.toFixed(1)} rgb(${b.color.r},${b.color.g},${b.color.b}) pos=(${b.bx.toFixed(0)},${b.by.toFixed(0)})${rotTag}`);
         }
 
         // ── 7. Assemble PSD ────────────────────────────────────────────────
@@ -866,6 +1250,17 @@ function initApp(){
           children:[...textLayers,...imgLayers,bgLayer],
         };
 
+        // ── Debug: PSD assembly ──
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY ──`,'dbg-section');
+        dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
+        dbg(`  Layer stack (top→bottom in Photoshop):`);
+        for(let li=0;li<psd.children.length;li++){
+          const ch=psd.children[li];
+          const type=ch.text?'TypeLayer':'Pixel';
+          dbg(`    [${li}] ${type}: "${ch.name}" ${ch.text?'transform=['+ch.text.transform.map(v=>v.toFixed(1)).join(',')+']':'bounds=('+ch.left+','+ch.top+')→('+ch.right+','+ch.bottom+')'}`,(ch.text?'dbg-ok':'dbg-img'));
+        }
+        dbg(`  writePsd options: invalidateTextLayers=true, noBackground=true`);
+
         const buf=agPsd.writePsd(psd,{invalidateTextLayers:true,generateThumbnail:false,noBackground:true});
         const blob=new Blob([buf],{type:'application/octet-stream'});
         const base=pdfFile.name.replace(/\.pdf$/i,'');
@@ -881,6 +1276,12 @@ function initApp(){
       }
     }
 
+    dbg(`════════════════════════════════════════`,'dbg-section');
+    dbg(`CONVERSION COMPLETE: ${psdResults.length} file(s)`,'dbg-section');
+    dbg(`════════════════════════════════════════`,'dbg-section');
+    for(const r of psdResults){
+      dbg(`  ${r.filename}: ${r.sizeMB} MB, ${r.textCount} text + ${r.imgCount||0} image layer(s)`);
+    }
     setProgress(100,'Done — '+psdResults.length+' file(s) ready');
     if(psdResults.length) buildDownloadUI();
     else log('No pages converted successfully.','err');
