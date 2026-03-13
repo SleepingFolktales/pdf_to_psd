@@ -911,8 +911,83 @@ function initApp(){
 
     let skippedTiny=0, skippedFullPage=0;
 
+    // ── Text color + bounds tracking (parallel pass alongside image extraction) ──
+    // PDF.js setFillRGBColor args are 0-255 integers (not 0-1 floats).
+    // We collect one color per non-empty text block (beginText…endText with ≥1 showText).
+    // We also extract text position from setTextMatrix and font size from setFont.
+    // These are matched to getTextContent items by ORDER — same rendering sequence.
+    const textColors=[];
+    const textBounds=[];
+    let tcFillR=0, tcFillG=0, tcFillB=0;
+    let tcInBlock=false, tcBlockHas=false;
+    let tcBlockR=0, tcBlockG=0, tcBlockB=0;
+    let tcFontSize=12;
+    let tcTextMatrixX=0, tcTextMatrixY=0;
+    let tcBlockFontSize=12;
+    let tcBlockX=0, tcBlockY=0;
+
     for(let i=0;i<ops.fnArray.length;i++){
       const fn=ops.fnArray[i], args=ops.argsArray[i];
+      // ── Color state tracking ──────────────────────────────────────────────
+      if(fn===pdfjsLib.OPS.setFillRGBColor){
+        // PDF.js 3.x passes RGB as 0-255 integers in the operator list.
+        // Guard: if somehow float 0-1, scale up. args[0]>1 means already integer scale.
+        const s=args[0]>1?1:255;
+        tcFillR=Math.min(255,Math.round(args[0]*s));
+        tcFillG=Math.min(255,Math.round(args[1]*s));
+        tcFillB=Math.min(255,Math.round(args[2]*s));
+      }else if(fn===pdfjsLib.OPS.setFillGray){
+        // gray: same 0-255 integer scale as RGB in PDF.js 3.x
+        const s=args[0]>1?1:255;
+        const gv=Math.min(255,Math.round(args[0]*s));
+        tcFillR=gv; tcFillG=gv; tcFillB=gv;
+      }else if(fn===pdfjsLib.OPS.setFillCMYKColor){
+        // Approximate CMYK→RGB for color extraction
+        const c=args[0],m=args[1],y=args[2],k=args[3];
+        tcFillR=Math.round(255*(1-c)*(1-k));
+        tcFillG=Math.round(255*(1-m)*(1-k));
+        tcFillB=Math.round(255*(1-y)*(1-k));
+      }else if(fn===pdfjsLib.OPS.beginText){
+        tcInBlock=true; tcBlockHas=false;
+        // Capture fill color AT beginText (before any per-char setFont/color ops inside)
+        tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
+      }else if(fn===pdfjsLib.OPS.showText||fn===pdfjsLib.OPS.showSpacedText){
+        if(tcInBlock){
+          tcBlockHas=true;
+          // Update with the most recent fill color at the time of actual drawing
+          tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
+        }
+      }else if(fn===pdfjsLib.OPS.setFont){
+        // Capture font size for text bounds calculation
+        tcFontSize=args[1]||12;
+        tcBlockFontSize=tcFontSize;
+      }else if(fn===pdfjsLib.OPS.setTextMatrix){
+        // Capture text position in PDF coordinates: args = [a, b, c, d, e, f] (6-element matrix)
+        // e = x position, f = y position in PDF user-space
+        tcTextMatrixX=args[4]||0;
+        tcTextMatrixY=args[5]||0;
+        tcBlockX=tcTextMatrixX;
+        tcBlockY=tcTextMatrixY;
+      }else if(fn===pdfjsLib.OPS.endText){
+        if(tcBlockHas){
+          textColors.push({r:tcBlockR,g:tcBlockG,b:tcBlockB});
+          // Extract text bounds from operator coordinates
+          // Convert PDF coordinates to canvas pixels using viewport transform
+          const vTx=vpT[0], vTy=vpT[1], vTc=vpT[2], vTd=vpT[3], vTe=vpT[4], vTf=vpT[5];
+          const canvasX=vTx*tcBlockX+vTc*tcBlockY+vTe;
+          const canvasY=vTy*tcBlockX+vTd*tcBlockY+vTf;
+          const canvasH=Math.abs(vTd)*tcBlockFontSize;
+          const canvasW=Math.abs(vTx)*tcBlockFontSize*2.5; // Rough estimate: font size * 2.5 for average text width
+          textBounds.push({
+            left:Math.floor(canvasX),
+            top:Math.floor(canvasY-canvasH),
+            right:Math.ceil(canvasX+canvasW),
+            bottom:Math.ceil(canvasY)
+          });
+        }
+        tcInBlock=false;
+      }
+      // ── CTM + image extraction (existing logic) ───────────────────────────
       if(fn===pdfjsLib.OPS.save){ ctmStack.push([...ctm]); }
       else if(fn===pdfjsLib.OPS.restore){ if(ctmStack.length) ctm=ctmStack.pop(); }
       else if(fn===pdfjsLib.OPS.transform){ ctm=mul(ctm,args); }
@@ -969,7 +1044,14 @@ function initApp(){
     dbg(`  Found: ${results.length} image(s)`,(results.length?'dbg-ok':'dbg-warn'));
     dbg(`  Skipped tiny (<30px): ${skippedTiny}`,'dbg-dim');
     dbg(`  Skipped full-page (>90%): ${skippedFullPage}`,'dbg-dim');
-    return results;
+    dbg(`  Text color blocks extracted from op list: ${textColors.length}`,(textColors.length?'dbg-ok':'dbg-warn'));
+    dbg(`  Text bounds extracted from op list: ${textBounds.length}`,(textBounds.length?'dbg-ok':'dbg-warn'));
+    for(let ci=0;ci<textColors.length;ci++){
+      const c=textColors[ci];
+      const b=textBounds[ci]||{left:0,top:0,right:0,bottom:0};
+      dbg(`    Block ${ci+1}: rgb(${c.r},${c.g},${c.b}) bounds=(${b.left},${b.top},${b.right},${b.bottom})`,'dbg-dim');
+    }
+    return {images:results, textColors, textBounds};
   }
 
   // ── Main conversion ────────────────────────────────────────────────────────
@@ -1129,24 +1211,16 @@ function initApp(){
           continue;
         }
 
-        // ── 3. Sample text colors from the PRISTINE render ─────────────────
-        //    Must happen before any canvas modification.
+        // Canvas pixel sampling overrides op-list colors (more accurate for blended/gradient text)
         if(doColors){
           for(const it of rawItems) it.color=sampleColor(bgCtx,it.x,it.y,it.width,it.height);
-          log('Page '+pageNum+': colors sampled');
-          dbg(`── PAGE ${pageNum} COLOR SAMPLING ──`,'dbg-section');
+          log('Page '+pageNum+': colors sampled (canvas override)');
+          dbg(`── PAGE ${pageNum} CANVAS COLOR OVERRIDE ──`,'dbg-section');
           for(let ti=0;ti<Math.min(rawItems.length,20);ti++){
             const it=rawItems[ti];
             dbg(`  T${ti+1}: "${it.str.slice(0,30)}" → rgb(${it.color.r},${it.color.g},${it.color.b})`,'dbg-dim');
           }
         }
-
-        // ── 4. Extract embedded images from the PRISTINE render ──────────
-        //    CRITICAL: must run BEFORE step 5 modifies the canvas.
-        //    We copy each image's rectangle from the clean, unmodified render
-        //    so the image layers have perfect pixels.
-        setProgress(((pi+.55)/pages.length)*90,'Page '+pageNum+' — extracting images…');
-        const extractedImgs=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height,pageNum);
         const imgLayers=[];
         const seenBounds=[];
         for(let k=0;k<extractedImgs.length;k++){
