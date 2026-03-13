@@ -187,8 +187,8 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
     <div class="toggles" style="margin-top:14px">
       <div class="toggle-row">
         <div>
-          <div class="tr-label">Remove text from background layer</div>
-          <div class="tr-sub">Samples local surrounding color per text item and paints over it — handles colored backgrounds</div>
+          <div class="tr-label">Clean up background (separate text & images)</div>
+          <div class="tr-sub">Cuts text and image regions out of the background layer — the TypeLayers and image layers fill the gaps</div>
         </div>
         <label class="toggle"><input type="checkbox" id="opt-erase" checked><span class="toggle-track"></span></label>
       </div>
@@ -777,32 +777,62 @@ function initApp(){
           continue;
         }
 
-        // ── 3. Sample colors BEFORE erasing ────────────────────────────────
+        // ── 3. Sample text colors from the PRISTINE render ─────────────────
+        //    Must happen before any canvas modification.
         if(doColors){
           for(const it of rawItems) it.color=sampleColor(bgCtx,it.x,it.y,it.width,it.height);
           log('Page '+pageNum+': colors sampled');
         }
 
-        // ── 4. Paint over each text item with its LOCAL background color ────────
-        // Per-item local sampling: reads a strip above & below each glyph run to
-        // find the true background color at that spot.  Handles colored sections,
-        // dark bands, and gradient fills correctly — much better than the old
-        // single-color page-wide approach.
+        // ── 4. Extract embedded images from the PRISTINE render ──────────
+        //    CRITICAL: must run BEFORE step 5 modifies the canvas.
+        //    We copy each image's rectangle from the clean, unmodified render
+        //    so the image layers have perfect pixels.
+        setProgress(((pi+.55)/pages.length)*90,'Page '+pageNum+' — extracting images…');
+        const extractedImgs=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height);
+        const imgLayers=[];
+        const seenBounds=[];
+        for(let k=0;k<extractedImgs.length;k++){
+          const img=extractedImgs[k];
+          // Clamp to canvas bounds
+          const cl=Math.max(0,img.left), ct=Math.max(0,img.top);
+          const cr=Math.min(bgCanvas.width,img.right), cb=Math.min(bgCanvas.height,img.bottom);
+          const cw=cr-cl, ch=cb-ct;
+          if(cw<=0||ch<=0) continue;
+          // Dedup: skip if nearly identical bounds already extracted
+          const isDupe=seenBounds.some(s=>Math.abs(s[0]-cl)<5&&Math.abs(s[1]-ct)<5&&Math.abs(s[2]-cr)<5&&Math.abs(s[3]-cb)<5);
+          if(isDupe) continue;
+          seenBounds.push([cl,ct,cr,cb]);
+          const c=document.createElement('canvas');
+          c.width=cw; c.height=ch;
+          c.getContext('2d').drawImage(bgCanvas,cl,ct,cw,ch,0,0,cw,ch);
+          imgLayers.push({name:'IMG '+(k+1)+' ('+cw+'×'+ch+')',top:ct,left:cl,bottom:cb,right:cr,canvas:c});
+        }
+        if(imgLayers.length) log('Page '+pageNum+': '+imgLayers.length+' image layer(s) extracted','ok');
+
+        // ── 5. Clean up background — cut out text & image regions ─────────
+        //    clearRect → transparent holes.  In the final PSD composite:
+        //      • TypeLayers fill the text holes (Photoshop renders them)
+        //      • Image pixel-layers fill the image holes
+        //      • Background shows only base design (shapes, borders, fills)
         if(doErase){
+          // Cut text regions (2 px padding around each glyph run)
           for(const it of rawItems){
-            const bg=sampleLocalBg(bgCtx,it.x,it.y,it.width,it.height,bgCanvas.width,bgCanvas.height);
-            bgCtx.fillStyle=`rgb(${bg.r},${bg.g},${bg.b})`;
-            bgCtx.fillRect(
-              Math.floor(it.x)-1,
-              Math.floor(it.y)-1,
-              Math.ceil(it.width)+2,
-              Math.ceil(it.height)+2
+            bgCtx.clearRect(
+              Math.floor(it.x)-2,
+              Math.floor(it.y)-2,
+              Math.ceil(it.width)+4,
+              Math.ceil(it.height)+4
             );
           }
-          log('Page '+pageNum+': '+rawItems.length+' text item(s) erased (per-item local bg)');
+          // Cut image regions (they now live in their own layers)
+          for(const il of imgLayers){
+            bgCtx.clearRect(il.left,il.top,il.right-il.left,il.bottom-il.top);
+          }
+          log('Page '+pageNum+': background cleaned — '+rawItems.length+' text + '+imgLayers.length+' image region(s) cut');
         }
 
-        // ── 5. Merge into TypeLayer blocks (for layer count only) ───────────
+        // ── 6. Merge into TypeLayer blocks ───────────────────────────────
         let blocks;
         if(doMerge){
           blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
@@ -811,24 +841,6 @@ function initApp(){
           blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,fontName:it.fontName,fontSize:it.fontSize,color:it.color,isRotated:it.isRotated,cosA:it.cosA,sinA:it.sinA}));
           log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
         }
-
-        // ── 6. Extract embedded images as separate layers ──────────────────
-        setProgress(((pi+.7)/pages.length)*90,'Page '+pageNum+' — extracting images…');
-        const extractedImgs=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height);
-        const imgLayers=[];
-        for(let k=0;k<extractedImgs.length;k++){
-          const img=extractedImgs[k];
-          // Clamp to canvas bounds
-          const cl=Math.max(0,img.left), ct=Math.max(0,img.top);
-          const cr=Math.min(bgCanvas.width,img.right), cb=Math.min(bgCanvas.height,img.bottom);
-          const cw=cr-cl, ch=cb-ct;
-          if(cw<=0||ch<=0) continue;
-          const c=document.createElement('canvas');
-          c.width=cw; c.height=ch;
-          c.getContext('2d').drawImage(bgCanvas,cl,ct,cw,ch,0,0,cw,ch);
-          imgLayers.push({name:'IMG '+(k+1)+' ('+cw+'×'+ch+')',top:ct,left:cl,bottom:cb,right:cr,canvas:c});
-        }
-        if(imgLayers.length) log('Page '+pageNum+': '+imgLayers.length+' image layer(s) extracted','ok');
 
         // ── 7. Assemble PSD ────────────────────────────────────────────────
         setProgress(((pi+.85)/pages.length)*90,'Page '+pageNum+' — writing PSD…');
