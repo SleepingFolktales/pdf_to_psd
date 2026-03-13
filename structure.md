@@ -1,11 +1,11 @@
-# PDF-to-PSD Converter — Feasibility Report
-## ag-psd (JavaScript) · Single HTML File Approach
+# PDF-to-PSD Converter — Architecture & Structure
+## ag-psd (JavaScript) · Single HTML File · v2 Pipeline
 
 ---
 
-## Verdict: ✅ Feasible — with one known UX caveat
+## Verdict: ✅ Feasible — production-grade with known UX caveat
 
-The plan is sound. A fully client-side, single-HTML-file PDF→PSD converter using **ag-psd** and **PDF.js** is achievable with no server, no install, and no build step. Both libraries ship browser bundles that load directly from CDN inside a `<script>` tag.
+A fully client-side, single-HTML-file PDF→PSD converter using **ag-psd** and **PDF.js**. No server, no install, no build step. Both libraries load from CDN.
 
 ---
 
@@ -13,23 +13,25 @@ The plan is sound. A fully client-side, single-HTML-file PDF→PSD converter usi
 
 ### ag-psd (v30.1.0)
 
-The library is actively maintained (637 stars, latest release March 2025) and is the most capable open-source PSD writer in JavaScript.
+Actively maintained (637 stars, latest release March 2025). Most capable open-source PSD writer in JavaScript.
 
-**What it can do for this project:**
-- Write PSD files entirely in the browser — no Node.js required
-- Supports `layer.text` property, which creates real TypeLayers (editable "T" layers in Photoshop)
-- Accepts `transform`, `style.font`, `style.fontSize`, `style.fillColor` per text layer
-- Supports multi-span `styleRuns` for mixed colors/fonts within one block
-- Outputs `ArrayBuffer` → trivially downloadable with `FileSaver.js`
-- Has a pre-built bundle at `unpkg.com/ag-psd/dist/bundle.js` (loads as `window.agPsd`)
+**Capabilities:**
+- Write PSD files entirely in the browser
+- Real TypeLayers via `layer.text` property (editable "T" layers in Photoshop)
+- `transform`, `style.font`, `style.fontSize`, `style.fillColor` per text layer
+- Rotated text via affine transform matrix `[cosA, sinA, -sinA, cosA, tx, ty]`
+- Multi-span `styleRuns` for mixed colors/fonts within one block
+- Outputs `ArrayBuffer` → downloadable with `FileSaver.js`
+- CDN bundle: `unpkg.com/ag-psd/dist/bundle.js` (loads as `window.agPsd`)
 
-**Text layer API (the critical part):**
+**Text layer API:**
 ```js
 {
   name: 'Text: Hello World',
   text: {
-    text: 'Hello World\r',               // \r required, not \n
-    transform: [1, 0, 0, 1, left, top],  // translate to position
+    text: 'Hello World\r',
+    transform: [1, 0, 0, 1, left, top],   // identity + translation (horizontal)
+    // OR:  [cosA, sinA, -sinA, cosA, left, top]  // rotation (vertical text)
     style: {
       font: { name: 'ArialMT' },
       fontSize: 24,
@@ -38,163 +40,148 @@ The library is actively maintained (637 stars, latest release March 2025) and is
   }
 }
 ```
-This is dramatically simpler than the raw EngineData/TypeToolObjectSetting approach you were fighting with in psd-tools. ag-psd handles all the binary blob construction internally.
 
-**Known limitations relevant to this project:**
-- Text layer implementation is described as "incomplete" in the docs — but the `text` property works reliably for the use case here (write text blocks from scratch)
-- Writing vertical text orientation can crash Photoshop — not an issue for Canva exports
-- Does NOT redraw the bitmap raster of text layers — this triggers a **Photoshop prompt** on open (see caveat below)
-- No support for 16bpc or CMYK — Canva exports are always RGB 8bpc, so this is fine
+**Known limits:**
+- Text implementation "incomplete" in docs — but `text` property works reliably for writing from scratch
+- Vertical text orientation: supported via rotation transform workaround (not native vertical mode)
+- Does NOT pre-render text bitmap — triggers Photoshop "Update" prompt on open
+- No 16bpc, no CMYK output — always RGB 8-bit; CMYK PDFs detected + user warned
 
-**Why ag-psd will succeed where psd-tools failed:**
+### PDF.js (pdfjs-dist v3.11.174)
 
-psd-tools requires you to manually construct EngineData binary blobs, keep `RunLengthArray` sums matching, manage `TEXT_ENGINE_DATA` deletion, and inject raw `TypeToolObjectSetting` tagged blocks. One character count mismatch silently drops the TypeLayer. ag-psd abstracts all of that into the `layer.text` object — it handles EngineData construction, `Txt`/`Editor.Text` sync, RunLengthArray, and the document-level cleanup automatically.
+Mozilla's PDF.js — the standard for in-browser PDF rendering and text extraction.
 
----
+**Text extraction** — `page.getTextContent()` returns items with:
+- `str`, `transform` (position + font size), `width`, `height`, `fontName`, `dir`
 
-### PDF.js (pdfjs-dist)
+**Image extraction** — `page.getOperatorList()` returns the full draw-call stream.
+Walking this with CTM tracking reveals every embedded image's position and size.
 
-Mozilla's PDF.js is the de facto standard for in-browser PDF rendering and text extraction. It's what Firefox uses internally.
+**Page rendering** — `page.render()` renders full page to Canvas at any DPI.
 
-**What it provides for this project:**
-
-**Text extraction** — `page.getTextContent()` returns per-item objects with:
-- `str` — the text string
-- `transform` — `[scaleX, 0, 0, scaleY, x, y]` matrix (position + font size)
-- `width`, `height` — bounding box dimensions
-- `fontName` — e.g. `"g_d0_f2"` (internal name, requires font dictionary lookup)
-- `dir` — text direction (ltr/rtl)
-
-**Font metadata** — `page.getOperatorList()` combined with `PDFDocumentProxy.getFontData()` gives access to the font dictionary, including the "actual" font name (e.g. `ArialMT`, `ABCDEF+Montserrat-Bold`).
-
-**Page rendering** — `page.render({ canvasContext, viewport })` renders the full page to an HTML Canvas at any DPI. This is the background layer.
-
-**CDN availability** — `https://unpkg.com/pdfjs-dist/build/pdf.min.mjs` (ESM) or the legacy UMD build. The worker can point to `https://unpkg.com/pdfjs-dist/build/pdf.worker.min.mjs`.
-
-**Coordinate system note:** PDF.js uses top-left origin (unlike native PDF which is bottom-left). Coordinates map directly to canvas pixels after applying `viewport.scale` — no Y-flip required, matching the PSD coordinate system perfectly.
+**Coordinate system:** PDF.js uses top-left origin after viewport transform — maps directly to canvas/PSD pixel coordinates.
 
 ---
 
-## Architecture: Single HTML File
+## v2 Architecture: Pristine-First Extraction
 
-Both libraries are loadable from CDN with no bundler. The entire app runs in the browser.
+The v1 pipeline rendered everything to one canvas, then tried to erase text with `fillRect`. This left colored rectangles, couldn't separate images, and baked vectors/shapes into the background.
+
+**v2 inverts the order: extract from the pristine render first, then cut.**
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Single HTML File (no server, no install)           │
-│                                                     │
-│  CDN imports:                                       │
-│  • pdfjs-dist/build/pdf.min.js  (PDF parsing)      │
-│  • ag-psd/dist/bundle.js        (PSD writing)      │
-│  • FileSaver.js                 (download)          │
-│                                                     │
-│  Flow:                                              │
-│  [Drop PDF] → PDF.js extracts text + renders bg     │
-│            → Merge adjacent text blocks             │
-│            → Erase text from background canvas      │
-│            → ag-psd builds PSD with TypeLayers      │
-│            → FileSaver downloads .psd               │
-└─────────────────────────────────────────────────────┘
+PDF File
+  │
+  ▼
+┌──────────────────────────────────────────────────────┐
+│  1. RENDER — Full-page raster at target DPI          │
+│     page.render() → pristine bgCanvas                │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  2. EXTRACT TEXT — page.getTextContent()              │
+│     Per-item: str, bx/by, fontName, fontSize, color  │
+│     Rotation detection via viewport × item.transform  │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  3. SAMPLE COLORS — from the pristine canvas         │
+│     Per text item: most-common non-white pixel in    │
+│     the item's bbox → accurate text fill color       │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  4. EXTRACT IMAGES — from the pristine canvas        │
+│     Walk page.getOperatorList(), track CTM through   │
+│     save/restore/transform.  On paintImageXObject:   │
+│     map unit square through viewport×CTM → bbox.     │
+│     Copy each bbox from the CLEAN canvas → layer.    │
+│     Dedup near-identical bounds.  Skip < 30 px and   │
+│     full-page fills (> 90 % area).                   │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  5. CLEAN BACKGROUND — clearRect (transparency)      │
+│     For every text item:  clearRect its bbox         │
+│     For every image layer: clearRect its bbox        │
+│     Result: background has transparent holes where   │
+│     text and images were — the layers above fill     │
+│     those holes in the PSD composite.                │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  6. MERGE TEXT — group adjacent items into blocks     │
+│     Same-line:  y-band < 65 % fh, x-gap ≤ 4× fh    │
+│     Next-line:  x-align < 120 % fh, y-gap ≤ 2.5×fh │
+│     Guards:     block width < 45 %, height < 30 %    │
+│     Rotation:   never merge rotated + non-rotated    │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  7. ASSEMBLE PSD                                     │
+│     Layer stack (top → bottom in Photoshop):         │
+│       • TypeLayers (editable text, Photoshop renders)│
+│       • Image pixel-layers (photos, logos, decor)    │
+│       • Background pixel-layer (base design only)    │
+│                                                      │
+│     writePsd() with invalidateTextLayers: true       │
+└──────────┬───────────────────────────────────────────┘
+           │
+           ▼
+       PSD File
 ```
 
-Everything runs client-side. The PDF never leaves the user's browser. Share the HTML file via Slack, email, USB — it just works.
+### Why v2 is better than v1
 
-**One technical wrinkle with the PDF.js worker in a local file:**  
-When opening the HTML from the filesystem (`file://`), some browsers block cross-origin workers. The fix is to use the "fake worker" mode:
-```js
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  'https://unpkg.com/pdfjs-dist/build/pdf.worker.min.mjs';
-```
-Chrome accepts this. Firefox with strict local file security may not — in that case the HTML should be served from a simple local HTTP server (e.g. `python -m http.server 8080`), or you can inline the worker as a Blob URL. This can be documented in a README next to the file.
+| Problem | v1 (old) | v2 (current) |
+|---------|----------|--------------|
+| Text on background | `fillRect` with sampled color → visible artifacts | `clearRect` → clean transparent holes |
+| Image separation | Extracted AFTER canvas was modified | Extracted from PRISTINE render |
+| Layer ordering | Images copied modified pixels | Images have original clean pixels |
+| Vector shapes | Baked into flat background | Still baked (inherent PDF limit) but text+images cleanly separated |
+
+### Why vector shapes remain in the background
+
+PDF is a flat drawing model — shapes are just fill/stroke paint operations, not discrete objects. Extracting them as separate layers would require re-implementing a PDF renderer that categorizes every draw call. This is architecturally infeasible in a browser-only tool. The practical tradeoff: shapes stay in the background, but text and images (the parts users actually need to edit) are fully separated.
 
 ---
 
-## The One UX Caveat: Photoshop's Update Prompt
+## PSD Layer Structure
 
-When Photoshop opens a PSD with text layers created programmatically (by any library, not just ag-psd), it shows this dialog:
-
-> **"Some text layers need to be updated before they can be used for vector-based output. Do you want to update these layers now?"**
-> `[Update]` `[No]`
-
-**You must click "Update."** This is a one-time action per file open. After clicking Update, the text layers are fully editable TypeLayers — exactly as if you had created them in Photoshop yourself. This is the same behavior documented in ag-psd's README and is the expected result from any external PSD writer.
-
-This is NOT the same as psd-tools's failure mode (silently falling back to pixel data). ag-psd's layers ARE real TypeLayers — Photoshop just needs to rebuild the raster cache from the EngineData on first open.
+```
+PSD File (width × height = canvas pixels at DPI)
+│
+├── T1: "Greta Mae Evans"         ← TypeLayer (editable text)
+├── T2: "Digital Marketing"       ← TypeLayer
+├── T3: "About Me\nI have been…" ← TypeLayer (merged paragraph)
+├── T4: "+123-456-7890"           ← TypeLayer (rotated transform)
+│   ...
+├── IMG 1 (310×310)               ← Pixel layer (photo)
+├── IMG 2 (60×60)                 ← Pixel layer (ornament)
+├── IMG 3 (120×40)                ← Pixel layer (logo)
+│   ...
+└── Background                    ← Pixel layer (shapes, borders, fills)
+                                     Text + image holes = transparent
+```
 
 ---
 
-## Implementation Plan
+## Guards & Warnings
 
-### Stage 1 — PDF Parsing
-
-```js
-const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
-const page = await pdf.getPage(1);
-
-// Background render
-const viewport = page.getViewport({ scale: 2.0 }); // 144 DPI
-const canvas = document.createElement('canvas');
-canvas.width = viewport.width;
-canvas.height = viewport.height;
-await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
-
-// Text extraction
-const textContent = await page.getTextContent();
-const items = textContent.items; // [{str, transform, width, height, fontName}]
-```
-
-Each item's position comes from `transform[4]` (x) and `transform[5]` (y). Font size is `Math.abs(transform[3])`. This maps directly to PSD pixel coordinates after applying the same scale.
-
-### Stage 2 — Text Block Merging
-
-Group `items` that are:
-- Same font family (strip subset prefix before `+`)
-- Horizontally aligned within ~20px
-- Vertically adjacent (gap ≤ 1.5× font height)
-
-Compute union bounding box, concatenate strings with `\r` as line separator.
-
-### Stage 3 — Background Cleanup
-
-For each merged text block, erase its bounding box from the background canvas:
-```js
-ctx.clearRect(x - 2, y - 2, width + 4, height + 4);
-```
-
-### Stage 4 — PSD Assembly with ag-psd
-
-```js
-const { writePsd } = agPsd;
-
-const psd = {
-  width: canvas.width,
-  height: canvas.height,
-  children: [
-    // Background layer
-    {
-      name: 'Background',
-      canvas: backgroundCanvas,
-    },
-    // One TypeLayer per text block
-    ...textBlocks.map(block => ({
-      name: `Text: ${block.text.slice(0, 30)}`,
-      text: {
-        text: block.text + '\r',
-        transform: [1, 0, 0, 1, block.left, block.top],
-        style: {
-          font: { name: sanitizeFontName(block.fontName) },
-          fontSize: block.fontSize,
-          fillColor: block.color,
-        },
-      },
-    })),
-  ],
-};
-
-const buffer = writePsd(psd, { invalidateTextLayers: true });
-saveAs(new Blob([buffer]), 'output.psd');
-```
-
-The `invalidateTextLayers: true` option is what triggers the Photoshop update prompt — it tells Photoshop to redraw the text rasters from the EngineData, which is exactly what we want.
+| Guard | Trigger | Action |
+|-------|---------|--------|
+| Canvas size cap | Any dimension > 15,000 px | Auto-scale down, log warning |
+| PSD format limit | Any dimension > 30,000 px | Log error (Photoshop will reject) |
+| CMYK detection | `/DeviceCMYK` in raw PDF bytes | Show amber notice — output is RGB |
+| Image dedup | Near-identical bounds (< 5 px) | Skip duplicate extraction |
+| Full-page image | Image covers > 90 % of canvas | Skip (it's a background fill) |
+| Tiny image | Image < 30 px on either side | Skip (bullet, icon, pattern tile) |
 
 ---
 
@@ -202,54 +189,30 @@ The `invalidateTextLayers: true` option is what triggers the Photoshop update pr
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| Photoshop update prompt on open | Low | Expected behavior, one click, fully documented |
-| Font not installed on user's machine | Medium | Photoshop asks for substitution — user picks a replacement |
-| PDF.js worker blocked on `file://` | Low | Serve from `localhost` or inline worker as Blob URL |
-| Font name extraction from PDF.js | Medium | `fontName` from `getTextContent` is internal; need to cross-reference `page.commonObjs` for actual font name |
-| Complex multi-column layouts | Medium | Merging heuristic may group wrong blocks — tunable thresholds |
-| Very large PDFs (10+ pages) | Low | Process page-by-page, show progress bar |
-| Canva-specific font subsets (`ABCDEF+`) | Low | Strip prefix before `+`, map common PostScript names to system names |
+| Photoshop update prompt on open | Low | Expected behavior, one click, documented |
+| Font not installed on user's machine | Medium | Photoshop asks for substitution |
+| PDF.js worker blocked on `file://` | Low | Serve from `localhost` or inline Blob URL |
+| Complex multi-column layouts | Medium | Merge guards prevent cross-column; tunable |
+| Very large PDFs (10+ pages) | Low | Page-by-page processing, progress bar |
+| Canva font subsets (`ABCDEF+`) | Low | Strip prefix, map PostScript names |
+| Vector shapes not separated | Low | Inherent PDF limit — documented for users |
 
 ---
 
 ## Font Name Resolution
 
-PDF.js exposes internal font names from `getTextContent` (e.g. `g_d0_f2`). To get the real font name, resolve via:
+PDF.js internal names → system names:
+- Strip subset prefix: `'ABCDEF+Montserrat-Bold'.split('+').pop()`
+- Map PostScript: `ArialMT` → `Arial`, `TimesNewRomanPSMT` → `Times New Roman`
 
-```js
-const ops = await page.getOperatorList();
-// After render, fonts are loaded into commonObjs
-page.commonObjs.get(fontName, (font) => {
-  const realName = font.data?.fontFamily || font.name;
-});
+---
+
+## CDN Dependencies
+
+```
+pdfjs-dist@3.11.174  — PDF parsing + rendering
+ag-psd@30.1.0        — PSD file writing
+FileSaver.js@2.0.5   — Browser file download
 ```
 
-Alternatively, render first (which loads fonts), then query. For a safe fallback:
-- Strip subset prefix: `'ABCDEF+Montserrat-Bold'.split('+').pop()` → `'Montserrat-Bold'`
-- Map PostScript suffixes: `ArialMT` → `Arial`, `Arial-BoldMT` → `Arial Bold`
-
----
-
-## Comparison: ag-psd vs psd-tools
-
-| Dimension | psd-tools (Python) | ag-psd (JavaScript) |
-|---|---|---|
-| Text layer creation | Manual EngineData binary | `layer.text` object |
-| RunLengthArray management | Manual, error-prone | Automatic |
-| TEXT_ENGINE_DATA cleanup | Manual deletion required | `invalidateTextLayers` flag |
-| Failure mode | Silent (shows pixel data) | Photoshop update prompt |
-| Browser deployment | No (server required) | Yes (CDN bundle) |
-| Single file app | No | Yes |
-
----
-
-## What to Build Next
-
-The recommended path:
-
-1. **HTML prototype** — single file, CDN imports, basic pipeline (no merging, no font resolution). Get a PSD opening in Photoshop with TypeLayers.
-2. **Add text block merging** — tune thresholds against real Canva exports.
-3. **Add font resolution** — map PDF internal names to system font names.
-4. **Polish** — drag-and-drop, progress bar, multi-page support, DPI selector.
-
-The prototype can be done in one session. The polish is where the iteration happens.
+All loaded from jsdelivr with unpkg fallback. No build step required.
