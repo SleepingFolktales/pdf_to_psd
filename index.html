@@ -225,6 +225,7 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
           <div class="lim-item"><div class="lim-dot lim-ok"></div>Layer groups, order &amp; names</div>
           <div class="lim-item"><div class="lim-dot lim-ok"></div>Layer opacity &amp; blending</div>
           <div class="lim-item"><div class="lim-dot lim-ok"></div>Horizontal text orientation</div>
+          <div class="lim-item"><div class="lim-dot lim-ok"></div>Vertical text — rendered via rotation transform</div>
         </div>
         <div class="lim-section-title">⚠ Requires action on open in Photoshop</div>
         <div class="lim-grid">
@@ -232,17 +233,18 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
           <div class="lim-item"><div class="lim-dot lim-warn"></div>Composite image not generated — PS rebuilds on first save</div>
           <div class="lim-item"><div class="lim-dot lim-warn"></div>Predefined Paragraph / Character Styles not written — apply manually in PS</div>
           <div class="lim-item"><div class="lim-dot lim-warn"></div>Blending option changes need manual re-save in PS to update bitmap data</div>
+          <div class="lim-item"><div class="lim-dot lim-warn"></div>CMYK PDFs detected &amp; warned — output is always RGB 8-bit; convert in PS if needed</div>
+          <div class="lim-item"><div class="lim-dot lim-warn"></div>Canvas &gt; 15,000 px auto-capped — lower DPI to render at full size</div>
         </div>
-        <div class="lim-section-title">✗ Currently not supported</div>
+        <div class="lim-section-title">✗ Not supported (ag-psd library limits)</div>
         <div class="lim-grid">
-          <div class="lim-item"><div class="lim-dot lim-err"></div>CMYK, LAB, Indexed, Duotone, Multichannel color modes</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>True CMYK / LAB output — output is always RGB 8-bit</div>
           <div class="lim-item"><div class="lim-dot lim-err"></div>16-bit or 32-bit channels</div>
-          <div class="lim-item"><div class="lim-dot lim-err"></div>Large Document Format (.psb)</div>
-          <div class="lim-item"><div class="lim-dot lim-err"></div>Color palettes</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Large Document Format (.psb write)</div>
+          <div class="lim-item"><div class="lim-dot lim-err"></div>Color palettes / Indexed mode</div>
           <div class="lim-item"><div class="lim-dot lim-err"></div>Patterns &amp; Pattern Overlay effects</div>
           <div class="lim-item"><div class="lim-dot lim-err"></div>Frame / timeline animations</div>
           <div class="lim-item"><div class="lim-dot lim-err"></div>3D layer effects</div>
-          <div class="lim-item"><div class="lim-dot lim-err"></div>Vertical text orientation (causes corrupt PSD)</div>
           <div class="lim-item"><div class="lim-dot lim-err"></div>Some smart object filter types</div>
           <div class="lim-item"><div class="lim-dot lim-err"></div>Some latest-PS metadata fields</div>
         </div>
@@ -254,6 +256,18 @@ body{background:var(--bg0);color:var(--text);font-family:-apple-system,BlinkMacS
   <div id="ps-notice" class="notice notice-amber hidden">
     <span class="n-icon">⚠</span>
     <span>When opening the PSD in Photoshop, click <strong>Update</strong> on the prompt that appears. This rebuilds text layer bitmaps from the editable text data — expected behavior for any externally-generated PSD.</span>
+  </div>
+
+  <!-- CMYK Warning -->
+  <div id="cmyk-notice" class="notice notice-amber hidden">
+    <span class="n-icon">⚠</span>
+    <span><strong>CMYK color space detected.</strong> This PDF uses CMYK or device-specific colors. The output PSD will be RGB 8-bit — colors may shift slightly. For print-accurate CMYK, open the PSD in Photoshop and use <em>Image → Mode → CMYK Color</em>.</span>
+  </div>
+
+  <!-- Canvas / PSB Size Warning -->
+  <div id="canvas-notice" class="notice notice-amber hidden">
+    <span class="n-icon">⚠</span>
+    <span><strong>Large canvas detected.</strong> One or more pages exceeded the safe 15,000 px limit and were scaled down automatically. Lower the DPI to 72 or 144 to render at full scale without capping.</span>
   </div>
 
   <!-- Convert Button -->
@@ -348,6 +362,23 @@ function initApp(){
   }
   function fmtBytes(n){ return n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(1)+' MB'; }
 
+  // ── CMYK detection — scans raw PDF bytes for explicit CMYK colorspace markers ─
+  // Content streams are often compressed, but catalog/page resource dicts are not,
+  // so a plain-text search catches the vast majority of CMYK PDFs.
+  function detectCmyk(buf){
+    try{
+      const b=new Uint8Array(buf);
+      // Check the first 200 KB (header + catalog + page 1 resources) and last 50 KB
+      const regions=[[0,Math.min(200000,b.length)],[Math.max(0,b.length-50000),b.length]];
+      for(const[s,e] of regions){
+        // latin1 is byte-accurate for raw PDF content
+        const t=new TextDecoder('latin1').decode(b.subarray(s,e));
+        if(/\/DeviceCMYK|\/CalCMYK/i.test(t)) return true;
+      }
+      return false;
+    }catch{ return false; }
+  }
+
   // ── Expose globals for HTML onclick attrs ──────────────────────────────────
   window.resetAll=resetAll;
   window.startConversion=startConversion;
@@ -384,6 +415,8 @@ function initApp(){
     pdfFile=file;
     try{
       const buf=await file.arrayBuffer();
+      // Run CMYK scan before handing buf to PDF.js
+      const hasCmyk=detectCmyk(buf);
       pdfDoc=await pdfjsLib.getDocument({data:new Uint8Array(buf)}).promise;
       const n=pdfDoc.numPages;
       $('fb-name').textContent=file.name;
@@ -391,7 +424,8 @@ function initApp(){
       $('page-range').value=n>1?'1-'+n:'1';
       hide('drop-zone'); show('file-bar'); show('options-card');
       show('lim-card'); show('ps-notice'); show('convert-btn');
-      hide('progress-card'); hide('dl-card');
+      hide('progress-card'); hide('dl-card'); hide('canvas-notice');
+      if(hasCmyk) show('cmyk-notice'); else hide('cmyk-notice');
       $('log-console').innerHTML=''; $('dl-list').innerHTML=''; psdResults=[];
     }catch(err){ alert('Could not load PDF: '+(err.message||err)); resetAll(); }
   }
@@ -399,7 +433,7 @@ function initApp(){
   function resetAll(){
     pdfFile=pdfDoc=null; $('file-input').value=''; psdResults=[];
     show('drop-zone'); hide('file-bar'); hide('options-card');
-    hide('lim-card'); hide('ps-notice'); hide('convert-btn');
+    hide('lim-card'); hide('ps-notice'); hide('cmyk-notice'); hide('canvas-notice'); hide('convert-btn');
     hide('progress-card'); hide('dl-card');
   }
 
@@ -538,6 +572,8 @@ function initApp(){
           const gapY=it.y-mxY;
           const nextLine=Math.abs(it.x-mnX)<fh*.60 && gapY>=-(fh*.3) && gapY<=fh*1.8;
           if(!sameLine&&!nextLine) continue;
+          // ③ Never merge items with different rotation — keep vertical text separate
+          if(!!it.isRotated!==!!seed.isRotated) continue;
           // Block-size guards (prevent cross-column merges)
           const nW=Math.max(mxX,it.x+it.width)-Math.min(mnX,it.x);
           const nH=Math.max(mxY,it.y+it.height)-Math.min(mnY,it.y);
@@ -558,7 +594,7 @@ function initApp(){
         text+=it.str; prevY=it.y;
       }
 
-      blocks.push({ text, bx:gItems[0].bx, by:gItems[0].by, fontName:gItems[0].fontName, fontSize:gItems[0].fontSize, color:gItems[0].color });
+      blocks.push({ text, bx:gItems[0].bx, by:gItems[0].by, fontName:gItems[0].fontName, fontSize:gItems[0].fontSize, color:gItems[0].color, isRotated:gItems[0].isRotated, cosA:gItems[0].cosA, sinA:gItems[0].sinA });
     }
     return blocks;
   }
@@ -591,7 +627,23 @@ function initApp(){
         // ── 1. Render page ─────────────────────────────────────────────────
         log('Page '+pageNum+': rendering…');
         const page=await pdfDoc.getPage(pageNum);
-        const vp=page.getViewport({scale});
+        // Canvas size guard:
+        //   MAX_PX  = 15,000 px — safe for all modern browsers and well under PSD 30k limit
+        //   PSD_PX  = 30,000 px — hard PSD format cap; Photoshop rejects files beyond this
+        const MAX_PX=15000, PSD_PX=30000;
+        const rawVp=page.getViewport({scale});
+        const rawW=Math.round(rawVp.width), rawH=Math.round(rawVp.height);
+        let vp=rawVp;
+        if(rawW>MAX_PX||rawH>MAX_PX){
+          // Scale down to fit within MAX_PX on the longest side
+          const cap=Math.min(MAX_PX/rawW,MAX_PX/rawH);
+          vp=page.getViewport({scale:scale*cap});
+          log('Page '+pageNum+': ⚠ Canvas capped from '+rawW+'×'+rawH+'px → '+Math.round(vp.width)+'×'+Math.round(vp.height)+'px (lower DPI to avoid)','warn');
+          show('canvas-notice');
+        }else if(rawW>PSD_PX||rawH>PSD_PX){
+          log('Page '+pageNum+': ⚠ Canvas '+rawW+'×'+rawH+'px exceeds PSD 30,000px limit — Photoshop may refuse to open this file','warn');
+          show('canvas-notice');
+        }
         const bgCanvas=document.createElement('canvas');
         bgCanvas.width=Math.round(vp.width); bgCanvas.height=Math.round(vp.height);
         const bgCtx=bgCanvas.getContext('2d',{willReadFrequently:true});
@@ -615,6 +667,17 @@ function initApp(){
           const fontName=normFont(styleRec?styleRec.fontFamily:item.fontName);
           // Use cap-height (72%) so erase box doesn't extend too far above glyphs
           const capH=fontSize*.72;
+          // ── Rotation detection ──────────────────────────────────────────
+          // Map the PDF text-direction vector (transform[0], transform[1]) through
+          // the viewport matrix to get the canvas-space angle.  This correctly
+          // handles the PDF↔canvas y-flip so the PSD layer transform is accurate.
+          const [vTa,vTb,vTc,vTd]=vp.transform;
+          const pdA=item.transform[0], pdB=item.transform[1];
+          const cdX=vTa*pdA+vTc*pdB, cdY=vTb*pdA+vTd*pdB;
+          const tMag=Math.sqrt(cdX*cdX+cdY*cdY)||1;
+          const angle=Math.atan2(cdY,cdX);
+          const isRotated=Math.abs(angle)>Math.PI/12; // > 15°
+          const cosA=cdX/tMag, sinA=cdY/tMag;
           rawItems.push({
             str:item.str,
             bx, by,
@@ -622,6 +685,7 @@ function initApp(){
             width:itemW, height:capH,
             fontName, fontSize,
             color:{r:0,g:0,b:0},
+            isRotated, cosA, sinA,
           });
         }
         log('Page '+pageNum+': '+rawItems.length+' text item(s) found');
@@ -670,7 +734,7 @@ function initApp(){
           blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
           log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
         }else{
-          blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,fontName:it.fontName,fontSize:it.fontSize,color:it.color}));
+          blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,fontName:it.fontName,fontSize:it.fontSize,color:it.color,isRotated:it.isRotated,cosA:it.cosA,sinA:it.sinA}));
           log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
         }
 
@@ -681,7 +745,12 @@ function initApp(){
           name:'T'+(idx+1)+': '+b.text.replace(/\n/g,' ').slice(0,30),
           text:{
             text:b.text,
-            transform:[1,0,0,1,b.bx,b.by],
+            // Rotated text: apply the canvas-space rotation via the affine matrix
+            // [cosA, sinA, -sinA, cosA, tx, ty] — identical to Photoshop's own rotation
+            // convention.  Horizontal text uses identity [1,0,0,1,tx,ty] as before.
+            transform: b.isRotated
+              ? [b.cosA, b.sinA, -b.sinA, b.cosA, b.bx, b.by]
+              : [1,0,0,1,b.bx,b.by],
             style:{ font:{name:b.fontName}, fontSize:b.fontSize, fillColor:b.color },
           },
         }));
