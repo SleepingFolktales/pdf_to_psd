@@ -22,36 +22,48 @@ that arise when trying to separately extract images, vector shapes, and text.
 
 ---
 
-## 2. Pipeline Overview
+## 2. Pipeline Overview (v2 — Pristine-First Extraction)
 
 ```
 PDF File
   │
   ▼
-┌─────────────────────────┐
-│  1. PDF Parser           │  Extract text blocks + render full page
-│     • Text extraction    │
-│     • Full-page raster   │
-└──────────┬──────────────┘
+┌──────────────────────────────┐
+│  1. PDF Parser                │  Render full page + extract text + extract images
+│     • Full-page raster        │  (pristine canvas — nothing modified yet)
+│     • Text extraction         │
+│     • Image extraction (CTM)  │
+└──────────┬───────────────────┘
            │
            ▼
-┌─────────────────────────┐
-│  2. Post-Processing      │  Merge text blocks, erase text from background
-│     • Merge text blocks  │
-│     • Erase text regions │
-└──────────┬──────────────┘
+┌──────────────────────────────┐
+│  2. Sampling & Extraction     │  Sample text colors from pristine canvas
+│     • Color per text item     │  Copy image regions from pristine canvas
+│     • Image region copy       │  (before ANY canvas modification)
+└──────────┬───────────────────┘
            │
            ▼
-┌─────────────────────────┐
-│  3. PSD Builder          │  Assemble PSD with background + TypeLayers
-│     • Background pixel   │
-│     • TypeLayer inject   │
-│     • Strip stale data   │
-└──────────┬──────────────┘
+┌──────────────────────────────┐
+│  3. Background Cleanup        │  clearRect text + image regions
+│     • clearRect text boxes    │  (transparent holes — layers above fill them)
+│     • clearRect image boxes   │
+│     • Merge text blocks       │
+└──────────┬───────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│  4. PSD Builder               │  Assemble layered PSD
+│     • TypeLayers (top)        │  Text: editable, Photoshop renders from EngineData
+│     • Image layers (middle)   │  Photos/decor: separate, movable pixel layers
+│     • Background (bottom)     │  Base design: shapes, borders, fills only
+│     • Strip stale data        │
+└──────────┬───────────────────┘
            │
            ▼
        PSD File
 ```
+
+**Key design change from v1:** The old pipeline rendered everything, then tried to paint over text with `fillRect` using a sampled background color. This left visible artifacts and couldn't separate images. The v2 pipeline extracts from the pristine canvas first, then cuts out regions with `clearRect` (transparency). The PSD composite is assembled so that TypeLayers and image layers fill the transparent holes.
 
 ---
 
@@ -88,50 +100,95 @@ The result is one PIL/Canvas/Buffer image per page.
 
 ---
 
-## 4. Stage 2 — Post-Processing
+## 4. Stage 2 — Sampling, Extraction & Cleanup
 
-### 4.1 Merge Adjacent Text Blocks
+### 4.1 Sample Text Colors (from pristine canvas)
+
+Before any canvas modification, sample each text item's fill color by reading
+pixels within its bounding box.  Use the most-common non-white, non-transparent
+color (quantized to 5-bit buckets) — this gives accurate text fill colors even
+on colored or gradient backgrounds.
+
+### 4.2 Extract Embedded Images (from pristine canvas)
+
+Walk `page.getOperatorList()` and track the Current Transformation Matrix (CTM)
+through `save`/`restore`/`transform` operations.  When `paintImageXObject` or
+`paintJpegXObject` is encountered, map the unit square [0,1]×[0,1] through
+`viewport.transform × CTM` to get the image's canvas-pixel bounding box.
+
+For each detected image:
+- Skip if smaller than 30×30 px (bullets, icons, pattern tiles)
+- Skip if area > 90% of canvas (full-page background fill)
+- Deduplicate near-identical bounds (< 5 px difference)
+- Copy the rectangle from the **pristine, unmodified** canvas into a new layer canvas
+
+### 4.3 Clean Background (clearRect → transparent holes)
+
+The background raster contains text AND images (since it's a full-page render).
+Instead of painting over with a sampled color (v1 approach — leaves artifacts),
+use `clearRect` to create transparent holes:
+
+```js
+// Cut text regions (2 px padding around each glyph run)
+for (const it of rawItems) {
+  bgCtx.clearRect(it.x - 2, it.y - 2, it.width + 4, it.height + 4);
+}
+// Cut image regions (they now live in their own layers)
+for (const img of imgLayers) {
+  bgCtx.clearRect(img.left, img.top, img.width, img.height);
+}
+```
+
+In the final PSD composite:
+- TypeLayers fill the text holes (Photoshop renders them from EngineData)
+- Image pixel-layers fill the image holes
+- Background shows only the base design (shapes, borders, fills, patterns)
+
+### 4.4 Merge Adjacent Text Blocks
 
 Design tools (Canva, Figma, InDesign) often export each line of a text frame
 as a separate PDF text block.  Merge them back into logical groups:
 
-**Merge criteria:**
-- Same font family (strip weight/style suffixes for comparison)
-- Horizontal start aligned within ~20px
-- Vertical gap ≤ 1.5× font height
+**Merge criteria (v2 thresholds):**
+- Same line: y-band within 65% font height, x-gap ≤ 4× font height
+- Next line: x-aligned within 120% font height, vertical gap ≤ 2.5× font height
+- Block size guards: width < 45% canvas, height < 30% canvas (prevent cross-column)
+- Rotation guard: never merge rotated + non-rotated items
 
 After merging, re-compute the bounding box as the union of all merged blocks,
 and concatenate the text content.
-
-### 4.2 Erase Text Regions from Background
-
-The background raster contains text (since it's a full-page render).  Since
-text will be rendered by Photoshop's TypeLayer engine, we erase text regions
-from the background to prevent double-rendering:
-
-For each text block, paint its bounding box (with ~2px padding) transparent
-in the background image.
 
 ---
 
 ## 5. Stage 3 — PSD Assembly
 
-### 5.1 PSD Structure
+### 5.1 PSD Structure (v2 — three-tier layer stack)
 
 ```
 PSD File
-├── Canvas (max page width × max page height, RGBA)
-└── Group: "Page 1"
-    ├── PixelLayer: "Background (Page 1)"    ← full-page raster (text erased)
-    ├── TypeLayer:  "Text: Hello World"       ← editable text
-    ├── TypeLayer:  "Text: Lorem ipsum..."    ← editable text
-    └── ...
+├── Canvas (page width × page height at target DPI, RGBA)
+│
+├── T1: "Greta Mae Evans"         ← TypeLayer (editable text, on top)
+├── T2: "Digital Marketing"       ← TypeLayer
+├── T3: "+123-456-7890"           ← TypeLayer (rotated via transform matrix)
+│   ...
+├── IMG 1 (310×310)               ← Pixel layer (photo, extracted from pristine canvas)
+├── IMG 2 (60×60)                 ← Pixel layer (ornament/decoration)
+│   ...
+└── Background                    ← Pixel layer (base design — shapes/borders/fills)
+                                     Text + image regions = transparent holes
 ```
+
+**Layer order (first child = top in Photoshop):**
+1. TypeLayers — editable text, Photoshop renders bitmaps from EngineData
+2. Image layers — photos, logos, decorations; separate and movable
+3. Background — base design only; transparent where text/images were cut out
 
 ### 5.2 Background Layer
 
-Create a standard PixelLayer with the post-processed background image.
-Position at (0, 0), full page dimensions.
+Create a standard PixelLayer with the **cleaned** background canvas (after
+`clearRect` cut text + image regions).  Position at (0, 0), full page dimensions.
+The transparent holes are filled by the layers above in the composite view.
 
 ### 5.3 TypeLayers — The Critical Part
 
@@ -366,26 +423,26 @@ layer.text = {
 
 ---
 
-## 11. Summary of the Pipeline
+## 11. Summary of the Pipeline (v2)
 
 ```
 Input:  PDF file (any source: Canva, Figma, InDesign, Word, etc.)
 Output: PSD file with:
-        - 1 background PixelLayer (full page render, text erased)
-        - N TypeLayers (editable text, transparent pixel data)
+        - 1 background PixelLayer (base design — text/images cut out as transparent)
+        - M image PixelLayers (photos, logos, decorations — extracted from pristine render)
+        - N TypeLayers (editable text, positioned + optionally rotated)
 
 Steps:
-  1. Extract text blocks from PDF (position, content, font, color)
-  2. Merge adjacent text blocks into logical groups
-  3. Render full page as background raster image
-  4. Erase text regions from background (prevent double-rendering)
-  5. Create PSD with canvas size = page size
-  6. Add background as PixelLayer at (0,0)
-  7. For each text block:
-     a. Create transparent PixelLayer at text position
-     b. Build EngineData with single collapsed StyleRun
-     c. Build TypeToolObjectSetting with matching Txt + EngineData
-     d. Inject tagged block into PixelLayer
-  8. Strip document-level TEXT_ENGINE_DATA
-  9. Save PSD
+  1. Render full page at target DPI → pristine canvas
+  2. Extract text items from PDF (position, content, font, rotation)
+  3. Sample text fill colors from the pristine canvas
+  4. Walk operator list to find embedded images (CTM tracking)
+  5. Copy image regions from the PRISTINE canvas → separate layer canvases
+  6. clearRect text bounding boxes from canvas (transparent holes)
+  7. clearRect image bounding boxes from canvas (transparent holes)
+  8. Merge adjacent text items into logical groups
+  9. Create PSD with canvas size = page size
+  10. Stack layers: TypeLayers (top) → Image layers → Background (bottom)
+  11. writePsd with invalidateTextLayers: true
+  12. Save PSD — Photoshop prompts "Update" on open to render text bitmaps
 ```
