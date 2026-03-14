@@ -1,32 +1,161 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v2.5 (Text Bounds from Operator Trace)
+## Current Version: v2.6 (Direction A — Rasterized Canvas + TypeLayer Metadata)
 
 ---
 
 ## Known Issues
 
-### � P0 — Text layers have zero bounds (FIXED in v2.5)
-- **Status**: RESOLVED
-- **What was wrong**: PSD text layers had bounds=(0,0,0,0) — invisible in Photoshop. Background layer contained entire composite (text + images + vectors baked in).
-- **Root cause (DEEP)**: Text bounds came from canvas rendering via `getTextContent()`, which returns NO bounds info. The pipeline used `item.transform` (PDF coordinates) to calculate canvas positions, but these were RELATIVE to the PDF coordinate system, not absolute canvas pixels. Text was never rendered separately, so bounds were always (0,0,0,0).
-- **Why background had everything**: Single `page.render()` call rendered entire PDF (background + text + images + vectors) into one canvas. No separation occurred.
-- **The fix (v2.5)**: Extract text bounds directly from operator trace:
-  - `extractPageImages()` now parses `setFont` → captures font size
-  - Parses `setTextMatrix` → captures text position (x, y) in PDF coordinates
-  - Converts PDF coordinates to canvas pixels using viewport transform: `canvasX = vTx*pdfX + vTc*pdfY + vTe`
-  - Builds text bounds object: `{left, top, right, bottom}` in canvas space
-  - Returns `{images, textColors, textBounds}` from operator list walk
-  - Pipeline applies op-list bounds to rawItems by order index (PDF rendering order = getTextContent order)
-  - Text layers now have proper non-zero bounds and are visible in Photoshop
-- **Result**: Text layers now render with correct bounds, background is clean (no text baked in), and text is fully editable in Photoshop
-- **Secondary benefit**: Operator-extracted bounds are more accurate than canvas sampling because they come directly from the PDF drawing commands, not from pixel analysis.
+### � P0 — Text layers have zero bounds (RESOLVED in v2.6)
+- **Status**: RESOLVED — v2.6 Direction A fix implemented. Text layers now have non-zero bounds and are visible in Photoshop.
+- **Fix**: Each text block renders to an offscreen canvas, providing pixel data that ag-psd uses for bounds calculation while preserving TypeLayer metadata for editability.
 
-### 🟡 P1 — All fonts resolve to "sans-serif"
+---
+
+## P0 Deep Analysis (v2.5 post-mortem — Mar 14 2026)
+
+Test file: "Abstract Grand Opening Announcement Free Instagram Post.pdf" (Canva, 810×810pt, 1620×1620px @144DPI)
+
+### Discrepancy 1: Our bounds are written but Photoshop reads zero
+
+**What our debug log shows (non-zero bounds set on TypeLayer objects):**
+```
+[0] TypeLayer: "T1: opening"     bounds=(914,387)→(1482,591)  transform=[1,0,0,1,914,546]
+[1] TypeLayer: "T2: GRAND"       bounds=(617,148)→(1491,421)  transform=[1,0,0,1,618,361]
+[2] TypeLayer: "T3: GRAND"       bounds=(608,138)→(1482,411)  transform=[1,0,0,1,608,351]
+[3] TypeLayer: "T4: Will Be…"    bounds=(901,703)→(1482,802)  transform=[1,0,0,1,901,780]
+[4] TypeLayer: "T5: really…"     bounds=(978,1251)→(1482,1316) transform=[1,0,0,1,978,1302]
+[5] TypeLayer: "T6: 10 July…"    bounds=(697,808)→(1482,975)  transform=[1,0,0,1,698,938]
+[6] TypeLayer: "T7: JOIN NOW!"   bounds=(1154,1143)→(1439,1199) transform=[1,0,0,1,1154,1187]
+```
+
+**What PSD manifest returns (ALL zero for every text layer):**
+```
+T1: bounds={height:0, left:0, top:0, width:0}
+T2: bounds={height:0, left:0, top:0, width:0}
+... (all 7 text layers identical)
+```
+
+**Conclusion:** We set `top/left/bottom/right` on each TypeLayer JS object, but the PSD binary either:
+- (a) ag-psd ignores `top/left/bottom/right` for layers with `text` property (TypeLayers) — it only uses these for pixel layers with `canvas` data, OR
+- (b) `invalidateTextLayers: true` tells Photoshop to discard stored bounds and re-render the text — and since the font is missing, re-rendering produces empty bounds.
+- **(Most likely: BOTH a and b are true.)**
+
+### Discrepancy 2: Operator-extracted bounds are in WRONG coordinate space
+
+**getTextContent positions (correct — verified visually):**
+```
+T1 "opening":        pos=(914, 546)    ← upper-right, matches visual
+T2 "GRAND":          pos=(618, 361)    ← upper-center, matches visual
+T7 "JOIN NOW!":      pos=(1154, 1187)  ← lower-right, matches visual
+```
+
+**Operator-extracted bounds (WRONG — completely different locations):**
+```
+T1 "opening":        bounds=(863, 1159)→(1450, 1394)  ← lower area?!
+T2 "GRAND":          bounds=(367, 996)→(1155, 1312)   ← middle area?!
+T7 "JOIN NOW!":      bounds=(38, 1523)→(200, 1588)    ← far bottom-left?!
+```
+
+**Root cause: Missing CTM (Current Transform Matrix) in coordinate conversion.**
+
+The operator trace shows text is drawn inside nested `save/transform/restore` groups:
+```
+[108] SAVE (depth=3)
+[109] TRANSFORM: [3.125, 0, 0, 3.125, 555.879, 760.136]   ← LOCAL CTM
+...
+[119] SET TEXT MATRIX: [1, 0, 0, -1, 431.531, 121.000]      ← LOCAL coords
+```
+
+The `setTextMatrix` args (431.531, 121.000) are in LOCAL space (relative to the CTM at [109]).
+Our code applies ONLY the viewport transform: `canvas = viewport × localCoords` ❌
+Correct calculation: `canvas = viewport × CTM × localCoords` ✓
+
+**Proof for T1 "opening":**
+- Base transform [1]: `[0.240, 0, 0, -0.240, 0, 817.920]`
+- Local CTM [109]: `[3.125, 0, 0, 3.125, 555.879, 760.136]`
+- Composed CTM = base × local = `[0.75, 0, 0, -0.75, 133.411, 635.487]`
+- Text matrix e,f = (431.531, 121.000)
+- Page coords = CTM × textPos = **(457.059, 544.737)** ← matches getTextContent transform[4,5] EXACTLY
+- Canvas coords = viewport × pageCoords = **(914.1, 546.4)** ← matches our pos=(914,546) ✓
+- Our WRONG calc: viewport × textPos directly = (863, 1394) ❌
+
+**Conclusion:** The operator bounds feature extracts systematically wrong coordinates. `getTextContent` already provides correct page-space coordinates — the operator bounds extraction is redundant AND broken.
+
+### Discrepancy 3: Font names make TypeLayers un-renderable
+
+**All 7 text layers report `fontAvailable: false`** with `fontName: "sans-serif"`.
+
+"sans-serif" is a CSS generic family name, NOT a Photoshop font. Photoshop cannot find it, cannot render the text, and therefore reports zero bounds — even if the PSD file contained correct bounds.
+
+This is a **fundamental blocker** for TypeLayer rendering in Photoshop. The actual fonts used in this PDF are likely Montserrat or similar (Canva design), but PDF.js `getTextContent()` only returns the CSS fallback family.
+
+### Discrepancy 4: Colors are actually CORRECT (no issue)
+
+**Our code sets:** rgb(94,55,109) for T1
+**PSD manifest shows:** rgb(red=12079, green=7067, blue=14006)
+**Verification:** 12079/32768×255 = 94.0, 7067/32768×255 = 54.9, 14006/32768×255 = 108.9 ✓
+
+Photoshop API uses 16-bit color space (0–32768). All colors are correct after conversion. The operator-list color extraction (v2.4) is working properly.
+
+### Discrepancy 5: Background still contains text (by design, not a bug)
+
+With `erase=false`, the background is the full `page.render()` composite. This is expected.
+With `erase=true`, `clearRect` cuts transparent holes — but since text layers are invisible (zero bounds), the holes would show through as transparent gaps with nothing underneath.
+
+**This creates a chicken-and-egg problem:** Erase only works if text layers render. Text layers only render if fonts are available. Fonts aren't available because we use CSS generic names.
+
+### Photoshop Screenshot Analysis
+
+Looking at the Photoshop screenshot with all layers visible:
+- **Background** (pixel): 1620×1620, shows full design including text ← text is baked in here
+- **IMG 1** (pixel): 878×991 at (0,629) — correct bounds ✓
+- **IMG 2** (pixel): 734×856 at (67,705) — correct bounds ✓
+- **T1–T7** (TypeLayer): All zero bounds — text is INVISIBLE, what user sees is from Background
+
+When user hides Background layer, text disappears entirely because TypeLayers render nothing.
+
+---
+
+### P0 Root Cause Summary (3 independent problems)
+
+| # | Problem | Severity | Can fix? |
+|---|---------|----------|----------|
+| A | **ag-psd ignores explicit bounds on TypeLayers** — only pixel layers (with `canvas`) get real bounds written to PSD binary | CRITICAL | Yes — provide canvas data alongside text property |
+| B | **`invalidateTextLayers: true` + missing font = zero bounds** — Photoshop re-renders text, can't find font, gets nothing | CRITICAL | Yes — set to false AND provide rasterized preview |
+| C | **Font names are CSS generics ("sans-serif")** — Photoshop can't render | HIGH | Partial — extract real names from PDF font dictionary |
+
+### P0 Fix Directions (research — no code yet)
+
+**Direction A: Rasterized text layers with TypeLayer metadata (RECOMMENDED)**
+- For each text item, render the string to a small off-screen `<canvas>` using browser's Canvas 2D API
+- Set this canvas as the layer's `canvas` property (pixel data for bounds + preview)
+- ALSO set the `text` property (TypeLayer metadata for editability)
+- ag-psd will write the pixel data for bounds AND the text descriptor for editing
+- Photoshop opens with visible text (from pixels) and editable text (from TypeLayer)
+- When user installs correct font + clicks "Update", Photoshop re-renders crisply
+- **This is how professional PSD generators work.**
+
+**Direction B: Pure pixel text layers (simpler, not editable)**
+- Render text to canvas, use as pixel layers only (no `text` property)
+- Text is visible with correct bounds but NOT editable in Photoshop
+- Simplest implementation but loses key feature
+
+**Direction C: Fix font names + hope user has fonts installed**
+- Extract real font names from PDF font dictionary (`page.commonObjs`)
+- If user has the font installed, TypeLayers render correctly
+- If not, same zero-bounds problem
+- Fragile — depends on user's font library
+
+**Direction D: Combination (A + C)**
+- Use Direction A for guaranteed visible text + Direction C for better font matching
+- Best user experience: text always visible, editable with correct font if installed
+
+### 🟡 P1 — Font names often resolve to "sans-serif" (PARTIALLY RESOLVED in v2.6)
 - **Symptom**: PDF.js returns generic style names (`g_d0_f1`, `g_d0_f2`, etc.) with `fontFamily: "sans-serif"` for all styles. Actual font names (e.g., Montserrat, Poppins) are lost.
 - **Root cause**: PDF.js `getTextContent()` returns style objects with the CSS fallback family, not the original PDF font name. The actual font name is embedded in the PDF font dictionary but not exposed through this API.
-- **Impact**: PSD TypeLayers all use "sans-serif" → Photoshop substitutes with a default font.
-- **Potential fix**: Parse the PDF font dictionary directly from page resources, or use `page.commonObjs` / `page.objs` to retrieve font metadata.
+- **Impact**: PSD TypeLayers often use "sans-serif" → Photoshop substitutes with a default font.
+- **v2.6 Fix**: Added `resolveFont()` helper that attempts to extract real PostScript font names from `page.commonObjs` after `page.render()`, falling back to `normFont()` for CSS generic names. This improves font matching for many PDFs but doesn't resolve all cases.
 
 ### � P2 — Text colors now extracted from operator list (FIXED)
 - **Status**: RESOLVED in v2.4
@@ -45,7 +174,7 @@
 
 | Toggle | ID | Default | Notes |
 |--------|-----|---------|-------|
-| Clean up background | `opt-erase` | **OFF** | Disabled due to P0 (transparent holes) |
+| Clean up background | `opt-erase` | **OFF** | Can now be enabled — P0 fixed in v2.6 |
 | Sample text colors | `opt-colors` | **OFF** | User preference for testing |
 | Merge adjacent text blocks | `opt-merge` | **OFF** | User preference for testing |
 
@@ -53,7 +182,29 @@
 
 ## What We Did (Changelog)
 
-### v2.4 — Text Color Extraction from Operator List (latest)
+### v2.6 — Direction A: Rasterized Canvas + TypeLayer Metadata (SUCCESS)
+- **Core Fix**: Each text block renders to an offscreen canvas (`document.createElement('canvas')`) with `fillText()` providing pixel data that ag-psd uses to derive non-zero bounds (lines ~1319-1352)
+- **TypeLayer Objects**: Now have both `canvas` AND `text` properties — Photoshop sees editable TypeLayer metadata while ag-psd gets the pixel data it needs for bounds calculation
+- **Removed `invalidateTextLayers: true`** from `writePsd()` call — this flag was actively harmful, causing Photoshop to ignore our pixel data. Now uses just `{generateThumbnail:false, noBackground:true}`
+- **Removed broken operator-extracted `textBounds`** — the `setTextMatrix`/`setFont` position extraction was in LOCAL coordinate space (missing CTM chain), making bounds systematically wrong. Only color extraction is retained from the operator list
+- **Added `resolveFont()` helper** (line ~520) — attempts to extract real PostScript font names from `page.commonObjs` after `page.render()`, falling back to `normFont()` for CSS generic names
+- **Background layer**: No longer sets explicit `bottom`/`right` — ag-psd derives these from the canvas dimensions
+- **RESULT: SUCCESS** — Text layers now have non-zero bounds and are visible in Photoshop. Users can double-click to edit text content.
+
+### v2.5 — Text Bounds from Operator Trace (FAILED)
+- Added `textBounds` extraction from `setFont` (size) and `setTextMatrix` (position) in `extractPageImages()`
+- Added `tWidth` passthrough to unmerged blocks
+- Added explicit `top/left/bottom/right` to TypeLayer objects in PSD assembly
+- Returns `{images, textColors, textBounds}` from operator list walk
+- **RESULT: FAILED** — PSD manifest still shows zero bounds for all text layers
+- **Root cause 1:** ag-psd ignores `top/left/bottom/right` on TypeLayers without canvas pixel data
+- **Root cause 2:** `invalidateTextLayers: true` + missing font = Photoshop re-renders to nothing
+- **Root cause 3:** Operator bounds extraction applies only viewport transform, missing CTM chain → wrong coordinates
+- **Root cause 4:** `getTextContent` already provides correct page-space coordinates, making operator extraction redundant
+- Debug log confirmed bounds were set on JS objects: e.g., T1 "opening" bounds=(914,387)→(1482,591)
+- But PSD manifest confirmed Photoshop reads: bounds=(0,0,0,0) for ALL text layers
+
+### v2.4 — Text Color Extraction from Operator List
 - Modified `extractPageImages()` to track color state during operator loop: `setFillRGBColor`, `setFillGray`, `setFillCMYKColor`
 - Records fill color for each `beginText…endText` block (text rendering order)
 - Returns `{images, textColors}` instead of just images
@@ -110,11 +261,20 @@
 - [x] Apply op-list colors to text items by rendering order (PDF order = getTextContent order)
 - [x] Make "Sample text colors" toggle a canvas override, not the only source
 
-### Next Session
-- [ ] Fix P0: background cleanup approach (fillRect with local bg color, or better erase bounds)
-- [ ] Fix P1: extract real font names from PDF font dictionary
-- [ ] Test with more PDFs (Figma, InDesign, Word exports)
+### Completed (v2.6)
+- [x] **Fix P0 (Direction A):** Render each text item to an off-screen canvas, use as layer `canvas` + `text` property combo
+  - Browser Canvas API renders text → gives ag-psd real pixel data → non-zero bounds guaranteed
+  - TypeLayer metadata preserved for Photoshop editability
+  - Erase toggle now works correctly (clearRect creates holes, pixel text layers fill them)
+- [x] **Fix P1:** Extract real font names from PDF font dictionary via `page.commonObjs` — implemented `resolveFont()` helper
+- [x] **Remove broken operator bounds:** Deleted the `textBounds` extraction from `extractPageImages()` — it was redundant and used wrong coordinate space
+- [x] Remove `invalidateTextLayers: true` from `writePsd()` call — was actively harmful
+
+### Next Session (v2.7 plan)
+- [ ] Test with more PDFs (Figma, InDesign, Word exports) to verify v2.6 fix works across different PDF creators
 - [ ] Verify color extraction works across different PDF creators (Canva, Figma, InDesign, Word)
+- [ ] Consider enabling "Clean up background" toggle by default now that text layers render correctly
+- [ ] Improve font name resolution — enhance `resolveFont()` to handle more edge cases and font formats
 
 ### Backlog
 - [ ] Smart layer grouping (group related text + image layers)

@@ -1,9 +1,11 @@
+<!-- PDF → PSD Converter v2.6 -->
+<!-- Direction A fix: Render text to offscreen canvases for non-zero bounds in Photoshop -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter</title>
+<title>PDF → PSD Converter v2.6</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -513,6 +515,21 @@ function initApp(){
     return FONT_MAP[lower]||stripped;
   }
 
+  // ── Real font name resolver (v2.6) ──────────────────────────────────────────
+  // After page.render(), PDF.js loads font objects into page.commonObjs.
+  // These contain the real PostScript font name (e.g. "ABCDEF+Montserrat-Bold").
+  // We strip the subset prefix and pass through normFont for Photoshop mapping.
+  function resolveFont(page, styleFontName, cssFallback){
+    try{
+      const fontObj=page.commonObjs.get(styleFontName);
+      if(fontObj && fontObj.name){
+        const psName=normFont(fontObj.name);
+        return psName;
+      }
+    }catch(e){}
+    return normFont(cssFallback);
+  }
+
   // ── Viewport coordinate converter ─────────────────────────────────────────
   function toCanvas(viewport,px,py){
     if(typeof viewport.convertToViewportPoint==='function') return viewport.convertToViewportPoint(px,py);
@@ -911,20 +928,17 @@ function initApp(){
 
     let skippedTiny=0, skippedFullPage=0;
 
-    // ── Text color + bounds tracking (parallel pass alongside image extraction) ──
+    // ── Text color tracking (parallel pass alongside image extraction) ──
     // PDF.js setFillRGBColor args are 0-255 integers (not 0-1 floats).
     // We collect one color per non-empty text block (beginText…endText with ≥1 showText).
-    // We also extract text position from setTextMatrix and font size from setFont.
     // These are matched to getTextContent items by ORDER — same rendering sequence.
+    // NOTE (v2.6): operator-extracted BOUNDS were removed — setTextMatrix coords are in LOCAL
+    // space (missing CTM chain), so they were systematically wrong. getTextContent positions
+    // are already correct in page-space. Only color extraction is kept here.
     const textColors=[];
-    const textBounds=[];
     let tcFillR=0, tcFillG=0, tcFillB=0;
     let tcInBlock=false, tcBlockHas=false;
     let tcBlockR=0, tcBlockG=0, tcBlockB=0;
-    let tcFontSize=12;
-    let tcTextMatrixX=0, tcTextMatrixY=0;
-    let tcBlockFontSize=12;
-    let tcBlockX=0, tcBlockY=0;
 
     for(let i=0;i<ops.fnArray.length;i++){
       const fn=ops.fnArray[i], args=ops.argsArray[i];
@@ -957,33 +971,9 @@ function initApp(){
           // Update with the most recent fill color at the time of actual drawing
           tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
         }
-      }else if(fn===pdfjsLib.OPS.setFont){
-        // Capture font size for text bounds calculation
-        tcFontSize=args[1]||12;
-        tcBlockFontSize=tcFontSize;
-      }else if(fn===pdfjsLib.OPS.setTextMatrix){
-        // Capture text position in PDF coordinates: args = [a, b, c, d, e, f] (6-element matrix)
-        // e = x position, f = y position in PDF user-space
-        tcTextMatrixX=args[4]||0;
-        tcTextMatrixY=args[5]||0;
-        tcBlockX=tcTextMatrixX;
-        tcBlockY=tcTextMatrixY;
       }else if(fn===pdfjsLib.OPS.endText){
         if(tcBlockHas){
           textColors.push({r:tcBlockR,g:tcBlockG,b:tcBlockB});
-          // Extract text bounds from operator coordinates
-          // Convert PDF coordinates to canvas pixels using viewport transform
-          const vTx=vpT[0], vTy=vpT[1], vTc=vpT[2], vTd=vpT[3], vTe=vpT[4], vTf=vpT[5];
-          const canvasX=vTx*tcBlockX+vTc*tcBlockY+vTe;
-          const canvasY=vTy*tcBlockX+vTd*tcBlockY+vTf;
-          const canvasH=Math.abs(vTd)*tcBlockFontSize;
-          const canvasW=Math.abs(vTx)*tcBlockFontSize*2.5; // Rough estimate: font size * 2.5 for average text width
-          textBounds.push({
-            left:Math.floor(canvasX),
-            top:Math.floor(canvasY-canvasH),
-            right:Math.ceil(canvasX+canvasW),
-            bottom:Math.ceil(canvasY)
-          });
         }
         tcInBlock=false;
       }
@@ -1045,13 +1035,11 @@ function initApp(){
     dbg(`  Skipped tiny (<30px): ${skippedTiny}`,'dbg-dim');
     dbg(`  Skipped full-page (>90%): ${skippedFullPage}`,'dbg-dim');
     dbg(`  Text color blocks extracted from op list: ${textColors.length}`,(textColors.length?'dbg-ok':'dbg-warn'));
-    dbg(`  Text bounds extracted from op list: ${textBounds.length}`,(textBounds.length?'dbg-ok':'dbg-warn'));
     for(let ci=0;ci<textColors.length;ci++){
       const c=textColors[ci];
-      const b=textBounds[ci]||{left:0,top:0,right:0,bottom:0};
-      dbg(`    Block ${ci+1}: rgb(${c.r},${c.g},${c.b}) bounds=(${b.left},${b.top},${b.right},${b.bottom})`,'dbg-dim');
+      dbg(`    Block ${ci+1}: rgb(${c.r},${c.g},${c.b})`,'dbg-dim');
     }
-    return {images:results, textColors, textBounds};
+    return {images:results, textColors};
   }
 
   // ── Main conversion ────────────────────────────────────────────────────────
@@ -1156,7 +1144,8 @@ function initApp(){
           if(fontSize<0.5) continue;
           const itemW=Math.max((item.width||0)*scale, fontSize*.4);
           const styleRec=tc.styles?.[item.fontName];
-          const fontName=normFont(styleRec?styleRec.fontFamily:item.fontName);
+          const cssFontFamily=styleRec?styleRec.fontFamily:'sans-serif';
+          const fontName=resolveFont(page, item.fontName, cssFontFamily);
           // Full font height with generous padding for ascenders/descenders
           // 0.72 cap-height was too small — ascenders (d,f,h) and descenders (g,y,p) leaked through
           const fullH=fontSize;
@@ -1209,6 +1198,27 @@ function initApp(){
           const fn=pages.length===1?base+'.psd':base+'_p'+pageNum+'.psd';
           psdResults.push({filename:fn,blob,pageNum,sizeMB:(blob.size/1048576).toFixed(2),textCount:0});
           continue;
+        }
+
+        // ── 3. Extract embedded images + text colors from operator list ──
+        //    CRITICAL: runs BEFORE step 5 modifies the canvas.
+        //    Extracts per-text-block fill colors directly from the PDF op stream.
+        //    NOTE (v2.6): operator-extracted bounds removed — they used wrong coordinate
+        //    space (missing CTM). getTextContent positions are already correct.
+        setProgress(((pi+.55)/pages.length)*90,'Page '+pageNum+' — extracting images & colors…');
+        const {images:extractedImgs, textColors:opListColors}=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height,pageNum);
+
+        // ── 4. Apply colors: op-list first (always), canvas sampling as override ─
+        // Assign by ORDER: op list text blocks are emitted in the same sequence as
+        // getTextContent items (both follow PDF rendering order).
+        for(let ti=0;ti<rawItems.length;ti++){
+          if(ti<opListColors.length) rawItems[ti].color=opListColors[ti];
+        }
+        dbg(`── PAGE ${pageNum} OPERATOR-LIST COLORS ──`,'dbg-section');
+        dbg(`  Op-list blocks: ${opListColors.length}, text items: ${rawItems.length}`);
+        for(let ti=0;ti<Math.min(rawItems.length,20);ti++){
+          const it=rawItems[ti]; const matched=ti<opListColors.length;
+          dbg(`  T${ti+1}: "${it.str.slice(0,30)}" → rgb(${it.color.r},${it.color.g},${it.color.b}) ${matched?'(op-list)':'(default black)'}`,(matched?'dbg-ok':'dbg-warn'));
         }
 
         // Canvas pixel sampling overrides op-list colors (more accurate for blended/gradient text)
@@ -1281,106 +1291,133 @@ function initApp(){
           }
         }
 
-        // ── 6. Merge into TypeLayer blocks ───────────────────────────────
-        let blocks;
-        if(doMerge){
-          blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
-          log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
-        }else{
-          blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,fontName:it.fontName,fontSize:it.fontSize,color:it.color,isRotated:it.isRotated,cosA:it.cosA,sinA:it.sinA}));
-          log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
+            // ── 6. Merge into TypeLayer blocks ───────────────────────────────
+            let blocks;
+            if(doMerge){
+              blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
+              log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
+            }else{
+              blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,tWidth:it.width,fontName:it.fontName,fontSize:it.fontSize,color:it.color,isRotated:it.isRotated,cosA:it.cosA,sinA:it.sinA}));
+              log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
+            }
+
+            // ── Debug: merged text blocks ──
+            dbg(`── PAGE ${pageNum} TEXT LAYERS (${doMerge?'merged':'unmerged'}) ──`,'dbg-section');
+            for(let bi=0;bi<blocks.length;bi++){
+              const b=blocks[bi];
+              const preview=b.text.replace(/\n/g,'\\n').slice(0,60);
+              const rotTag=b.isRotated?' ROT':'';
+              dbg(`  T${bi+1}: "${preview}" font=${b.fontName} size=${b.fontSize.toFixed(1)} rgb(${b.color.r},${b.color.g},${b.color.b}) pos=(${b.bx.toFixed(0)},${b.by.toFixed(0)})${rotTag}`);
+            }
+
+            // ── 7. Assemble PSD (v2.6 — Direction A: rasterized canvas + TypeLayer) ──
+            // ag-psd requires a `canvas` on every layer for non-zero bounds.
+            // We render each text block to an offscreen canvas AND set the `text`
+            // property so Photoshop sees it as an editable TypeLayer with a
+            // rasterized preview.  `invalidateTextLayers` is NOT set — Photoshop
+            // uses our pixel data as-is and offers "Update" if the font is available.
+            setProgress(((pi+.85)/pages.length)*90,'Page '+pageNum+' — writing PSD…');
+
+            const PAD=4; // padding around rendered text to avoid clipping descenders/ascenders
+            const textLayers=blocks.map((b,idx)=>{
+              const fs=b.fontSize;
+              const tw=b.tWidth||fs*b.text.length*0.6;
+              // Canvas size: text width + padding, font height * 1.4 (ascenders+descenders) + padding
+              const cW=Math.ceil(tw)+PAD*2;
+              const cH=Math.ceil(fs*1.4)+PAD*2;
+              // Render text to offscreen canvas
+              const tc=document.createElement('canvas');
+              tc.width=cW; tc.height=cH;
+              const ctx=tc.getContext('2d');
+              ctx.clearRect(0,0,cW,cH);
+              ctx.font=fs+'px sans-serif';
+              ctx.fillStyle='rgb('+b.color.r+','+b.color.g+','+b.color.b+')';
+              ctx.textBaseline='alphabetic';
+              // Draw at PAD from left, baseline at ~90% of font size + PAD from top
+              ctx.fillText(b.text, PAD, Math.round(fs*0.9)+PAD);
+              // top/left: where the canvas top-left sits in the document
+              // ag-psd derives bottom/right from canvas dimensions — do NOT set them
+              const tLeft=Math.floor(b.bx)-PAD;
+              const tTop=Math.floor(b.by-fs*0.9)-PAD;
+              return {
+                name:'T'+(idx+1)+': '+b.text.replace(/\n/g,' ').slice(0,30),
+                top:tTop, left:tLeft,
+                canvas:tc,
+                text:{
+                  text:b.text,
+                  transform: b.isRotated
+                    ? [b.cosA, b.sinA, -b.sinA, b.cosA, b.bx, b.by]
+                    : [1,0,0,1,b.bx,b.by],
+                  style:{ font:{name:b.fontName}, fontSize:fs, fillColor:b.color },
+                },
+              };
+            });
+
+            // Layer order (top→bottom): text → images → background
+            const bgLayer={name:'Background',top:0,left:0,canvas:bgCanvas};
+            const psd={
+              width:bgCanvas.width, height:bgCanvas.height,
+              children:[...textLayers,...imgLayers,bgLayer],
+            };
+
+            // ── Debug: PSD assembly ──
+            dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v2.6 — canvas+text) ──`,'dbg-section');
+            dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
+            dbg(`  Layer stack (top→bottom in Photoshop):`);
+            for(let li=0;li<psd.children.length;li++){
+              const ch=psd.children[li];
+              const type=ch.text?'TypeLayer+Canvas':'Pixel';
+              const cw=ch.canvas?ch.canvas.width:0, chh=ch.canvas?ch.canvas.height:0;
+              dbg(`    [${li}] ${type}: "${ch.name}" top=${ch.top} left=${ch.left} canvas=${cw}×${chh} ${ch.text?'transform=['+ch.text.transform.map(v=>v.toFixed(1)).join(',')+']':''}`,(ch.text?'dbg-ok':'dbg-img'));
+            }
+            dbg(`  writePsd options: noBackground=true (invalidateTextLayers NOT set)`);
+
+            const buf=agPsd.writePsd(psd,{generateThumbnail:false,noBackground:true});
+            const blob=new Blob([buf],{type:'application/octet-stream'});
+            const base=pdfFile.name.replace(/\.pdf$/i,'');
+            const fn=pages.length===1?base+'.psd':base+'_p'+pageNum+'.psd';
+            const sizeMB=(blob.size/1048576).toFixed(2);
+
+            psdResults.push({filename:fn,blob,pageNum,sizeMB,textCount:blocks.length,imgCount:imgLayers.length});
+            log('Page '+pageNum+': ✓ '+sizeMB+' MB — '+blocks.length+' text + '+imgLayers.length+' image layer(s)','ok');
+
+          }catch(err){
+            log('Page '+pageNum+': ERROR — '+err.message,'err');
+            console.error('Conversion error p'+pageNum,err);
+          }
         }
 
-        // ── Debug: merged text blocks ──
-        dbg(`── PAGE ${pageNum} TEXT LAYERS (${doMerge?'merged':'unmerged'}) ──`,'dbg-section');
-        for(let bi=0;bi<blocks.length;bi++){
-          const b=blocks[bi];
-          const preview=b.text.replace(/\n/g,'\\n').slice(0,60);
-          const rotTag=b.isRotated?` ROT`:'';
-          dbg(`  T${bi+1}: "${preview}" font=${b.fontName} size=${b.fontSize.toFixed(1)} rgb(${b.color.r},${b.color.g},${b.color.b}) pos=(${b.bx.toFixed(0)},${b.by.toFixed(0)})${rotTag}`);
+        dbg(`════════════════════════════════════════`,'dbg-section');
+        dbg(`CONVERSION COMPLETE: ${psdResults.length} file(s)`,'dbg-section');
+        dbg(`════════════════════════════════════════`,'dbg-section');
+        for(const r of psdResults){
+          dbg(`  ${r.filename}: ${r.sizeMB} MB, ${r.textCount} text + ${r.imgCount||0} image layer(s)`);
         }
-
-        // ── 7. Assemble PSD ────────────────────────────────────────────────
-        setProgress(((pi+.85)/pages.length)*90,'Page '+pageNum+' — writing PSD…');
-
-        const textLayers=blocks.map((b,idx)=>({
-          name:'T'+(idx+1)+': '+b.text.replace(/\n/g,' ').slice(0,30),
-          text:{
-            text:b.text,
-            // Rotated text: apply the canvas-space rotation via the affine matrix
-            // [cosA, sinA, -sinA, cosA, tx, ty] — identical to Photoshop's own rotation
-            // convention.  Horizontal text uses identity [1,0,0,1,tx,ty] as before.
-            transform: b.isRotated
-              ? [b.cosA, b.sinA, -b.sinA, b.cosA, b.bx, b.by]
-              : [1,0,0,1,b.bx,b.by],
-            style:{ font:{name:b.fontName}, fontSize:b.fontSize, fillColor:b.color },
-          },
-        }));
-
-        // Layer order (top→bottom): text → images → background
-        const bgLayer={name:'Background',top:0,left:0,bottom:bgCanvas.height,right:bgCanvas.width,canvas:bgCanvas};
-        const psd={
-          width:bgCanvas.width, height:bgCanvas.height,
-          children:[...textLayers,...imgLayers,bgLayer],
-        };
-
-        // ── Debug: PSD assembly ──
-        dbg(`── PAGE ${pageNum} PSD ASSEMBLY ──`,'dbg-section');
-        dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
-        dbg(`  Layer stack (top→bottom in Photoshop):`);
-        for(let li=0;li<psd.children.length;li++){
-          const ch=psd.children[li];
-          const type=ch.text?'TypeLayer':'Pixel';
-          dbg(`    [${li}] ${type}: "${ch.name}" ${ch.text?'transform=['+ch.text.transform.map(v=>v.toFixed(1)).join(',')+']':'bounds=('+ch.left+','+ch.top+')→('+ch.right+','+ch.bottom+')'}`,(ch.text?'dbg-ok':'dbg-img'));
-        }
-        dbg(`  writePsd options: invalidateTextLayers=true, noBackground=true`);
-
-        const buf=agPsd.writePsd(psd,{invalidateTextLayers:true,generateThumbnail:false,noBackground:true});
-        const blob=new Blob([buf],{type:'application/octet-stream'});
-        const base=pdfFile.name.replace(/\.pdf$/i,'');
-        const fn=pages.length===1?base+'.psd':base+'_p'+pageNum+'.psd';
-        const sizeMB=(blob.size/1048576).toFixed(2);
-
-        psdResults.push({filename:fn,blob,pageNum,sizeMB,textCount:blocks.length,imgCount:imgLayers.length});
-        log('Page '+pageNum+': ✓ '+sizeMB+' MB — '+blocks.length+' text + '+imgLayers.length+' image layer(s)','ok');
-
-      }catch(err){
-        log('Page '+pageNum+': ERROR — '+err.message,'err');
-        console.error('Conversion error p'+pageNum,err);
+        setProgress(100,'Done — '+psdResults.length+' file(s) ready');
+        if(psdResults.length) buildDownloadUI();
+        else log('No pages converted successfully.','err');
+        converting=false; $('convert-btn').disabled=false;
       }
-    }
 
-    dbg(`════════════════════════════════════════`,'dbg-section');
-    dbg(`CONVERSION COMPLETE: ${psdResults.length} file(s)`,'dbg-section');
-    dbg(`════════════════════════════════════════`,'dbg-section');
-    for(const r of psdResults){
-      dbg(`  ${r.filename}: ${r.sizeMB} MB, ${r.textCount} text + ${r.imgCount||0} image layer(s)`);
-    }
-    setProgress(100,'Done — '+psdResults.length+' file(s) ready');
-    if(psdResults.length) buildDownloadUI();
-    else log('No pages converted successfully.','err');
-    converting=false; $('convert-btn').disabled=false;
-  }
+      // ── Download UI ────────────────────────────────────────────────────────────
+      function buildDownloadUI(){
+        const list=$('dl-list'); list.innerHTML='';
+        psdResults.forEach(r=>{
+          const item=document.createElement('div'); item.className='dl-item';
+          const imgNote=r.imgCount?' + '+r.imgCount+' image':'';
+          item.innerHTML='<div class="dl-info"><div class="dl-name">'+r.filename+'</div><div class="dl-meta">'+r.sizeMB+' MB · '+r.textCount+' text'+imgNote+' layer'+(r.textCount+r.imgCount!==1?'s':'')+'</div></div>';
+          const btn=document.createElement('button'); btn.className='btn btn-primary btn-sm'; btn.textContent='↓ Download';
+          btn.onclick=()=>saveAs(r.blob,r.filename); item.appendChild(btn); list.appendChild(item);
+        });
+        $('dl-count-tag').textContent=psdResults.length+' file'+(psdResults.length!==1?'s':'');
+        $('dl-success-msg').textContent=psdResults.length+' PSD file'+(psdResults.length!==1?'s':'')+' ready. Open in Photoshop and click Update when prompted.';
+        if(psdResults.length>1) show('dl-all-wrap'); else hide('dl-all-wrap');
+        show('dl-card');
+      }
 
-  // ── Download UI ────────────────────────────────────────────────────────────
-  function buildDownloadUI(){
-    const list=$('dl-list'); list.innerHTML='';
-    psdResults.forEach(r=>{
-      const item=document.createElement('div'); item.className='dl-item';
-      const imgNote=r.imgCount?' + '+r.imgCount+' image':'';
-      item.innerHTML='<div class="dl-info"><div class="dl-name">'+r.filename+'</div><div class="dl-meta">'+r.sizeMB+' MB · '+r.textCount+' text'+imgNote+' layer'+(r.textCount+r.imgCount!==1?'s':'')+'</div></div>';
-      const btn=document.createElement('button'); btn.className='btn btn-primary btn-sm'; btn.textContent='↓ Download';
-      btn.onclick=()=>saveAs(r.blob,r.filename); item.appendChild(btn); list.appendChild(item);
-    });
-    $('dl-count-tag').textContent=psdResults.length+' file'+(psdResults.length!==1?'s':'');
-    $('dl-success-msg').textContent=psdResults.length+' PSD file'+(psdResults.length!==1?'s':'')+' ready. Open in Photoshop and click Update when prompted.';
-    if(psdResults.length>1) show('dl-all-wrap'); else hide('dl-all-wrap');
-    show('dl-card');
-  }
+      function downloadAll(){ psdResults.forEach((r,i)=>setTimeout(()=>saveAs(r.blob,r.filename),i*350)); }
 
-  function downloadAll(){ psdResults.forEach((r,i)=>setTimeout(()=>saveAs(r.blob,r.filename),i*350)); }
-
-} // end initApp()
-</script>
-</body>
-</html>
+    } // end initApp()
+    </script>
+    </body>
+    </html>
