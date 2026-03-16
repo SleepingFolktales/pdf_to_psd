@@ -1446,8 +1446,8 @@ function initApp(){
         lineJoinType:['miter','round','bevel'][gs.lineJoin||0]||'miter',
         miterLimit:gs.miterLimit||10,
         lineAlignment:'center',
-        content:c?{type:'color',color:{r:c.r,g:c.g,b:c.b}}:undefined,
       };
+      if(c) vectorStroke.content={type:'color',color:{r:c.r,g:c.g,b:c.b}};
     }
 
     // Preview canvas (ag-psd requires pixel data)
