@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v3.0 (Three-Phase Pipeline — Operator Segmentation → Classification → Canvas Replay Rasterization)
+## Current Version: v4.0 (Four-Phase Pipeline — Segmentation → Classification → Shape Layers / Rasterization → Unified Z-Order Assembly)
 
 ---
 
@@ -182,6 +182,16 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 
 ## What We Did (Changelog)
 
+### v4.0 — Four-Phase Pipeline with Bug Fixes and Native PSD Shape Layers
+- **Bug Fix 1 — Transform Chain**: CTM now starts from `viewportTransform` and accumulates at ALL save/restore depths (0, 1, 2, 3), not just depth ≥2. Each draw operation snapshots `ctmAtDraw` — the fully resolved CTM at the moment of painting. `computeGroupBounds` and rasterization now use per-draw-op CTMs instead of a single group-level transform. This fixes the "tiny misplaced layers" bug where vector elements were rendered at wrong size/position
+- **Bug Fix 2 — Z-Order Interleaving**: All layers (text, vector, image) are now collected into a single array, each tagged with a `_zIndex` from the walker's emission order. The array is sorted by z ascending then reversed for PSD convention (first child = topmost in Photoshop panel). Background is always the bottommost layer. This fixes the "grouped by type" bug where layers were stacked as text→vector→image instead of respecting actual paint order
+- **Bug Fix 3 — Sub-Group Splitting**: Implemented `flushSubGroup()` logic that detects depth-3 save/restore cycles within a depth-2 envelope. Each depth-3 cycle (representing a separate visual sub-element like a button background vs. button text) is emitted as its own `OperatorGroup` with its own `zIndex`, inheriting parent clips. This fixes the "mixed-content groups" bug where e.g. a pill shape and its label text were bundled into one misclassified group
+- **Phase 3A — Native PSD Shape Layers**: New `pdfPathToPsdVectorMask()` converts PDF path data (moveTo/lineTo/curveTo/rectangle/closePath) through the `ctmAtDraw` to pixel coordinates, then normalizes to 0.0–1.0 relative to document size with `[y,x]` knot ordering per ag-psd convention. `createShapeLayer()` builds full ag-psd layer objects with `vectorMask`, `vectorFill` (solid color), `vectorStroke` (with lineWidth scaled by CTM, cap/join types), and a rasterized preview canvas. `shouldUseShapeLayer()` gates eligibility (≤1 clip, solid colors only)
+- **Phase 3B — Rasterization Fallback**: Complex vectors (multiple clips, gradient fills, unsupported blend modes) fall back to `rasterizeForPreview()` which now uses per-draw-op CTM (`drawOp.ctmAtDraw`) for each replay step instead of a single group transform
+- **Unified Assembly**: `startConversion` now runs: extractPageImages → segmentOperatorList → classifyAllGroups → shape/rasterize loop → text/image layer building with z-tags → unified sort → PSD write
+- **Download UI**: Now shows shape layer count breakdown (e.g., "5 vector (3 shape)")
+- **Debug logging**: Updated for all four phases with CTM samples, z-index tags, shape vs raster breakdown
+
 ### v3.0 — Three-Phase Vector Layer Extraction Pipeline
 - **Architecture**: New three-phase pipeline walks the PDF.js operator list, segments it into discrete visual groups by save/restore depth, classifies each group, and rasterizes vector groups to isolated transparent canvases
 - **Phase 1 — Operator Group Segmentation** (`segmentOperatorList`): Single-pass scan of `fnArray`/`argsArray` tracking save/restore depth. Each depth-2 save/restore cycle = one visual element. Accumulates transforms (`mulMat`), colors, clips (with `clipTransform`), graphics state, and terminal draw ops (fill/stroke/image/text)
@@ -192,6 +202,7 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 - **Background cleanup**: Now also clears vector regions when "Clean up background" is enabled
 - **Debug logging**: Comprehensive per-phase debug output — segmentation groups, classification results, rasterization targets, and unified PSD assembly manifest
 - **RESULT**: Vector shapes (colored rectangles, rotated polygons, bezier decorations, button backgrounds) now extracted as independent PSD layers instead of being baked into the monolithic background
+- **KNOWN BUGS (fixed in v4.0)**: Transform chain missing viewport/page transforms (Bug 1), z-order grouped by type not paint order (Bug 2), mixed-content groups not split (Bug 3)
 
 ### v2.6 — Direction A: Rasterized Canvas + TypeLayer Metadata (SUCCESS)
 - **Core Fix**: Each text block renders to an offscreen canvas (`document.createElement('canvas')`) with `fillText()` providing pixel data that ag-psd uses to derive non-zero bounds (lines ~1319-1352)
@@ -289,15 +300,24 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 - [x] **Unified PSD assembly**: Text + vector + image + background layers at correct z-order
 - [x] **Vector shape extraction**: Filled rectangles, rotated polygons, bezier decorations, button backgrounds now separate layers
 
-### Next Session (v3.1 plan)
-- [ ] Test with Canva, Figma, InDesign, Word PDFs to verify vector extraction works across creators
-- [ ] Tune depth-2 segmentation heuristic for non-Canva PDFs (may need adaptive depth detection)
-- [ ] Improve `curveTo2`/`curveTo3` handling (currently approximated with quadratic/degenerate cubic)
-- [ ] Consider enabling "Clean up background" toggle by default now that vector layers are extracted
+### Completed (v4.0)
+- [x] **Bug Fix 1**: Transform chain now starts from viewport transform, accumulates at all depths, snapshots per-draw-op `ctmAtDraw`
+- [x] **Bug Fix 2**: Unified z-order assembly — all layers sorted by paint order instead of grouped by type
+- [x] **Bug Fix 3**: Sub-group splitting at depth-3 save/restore boundaries via `flushSubGroup()`
+- [x] **Phase 3A**: Native PSD Shape Layers — `pdfPathToPsdVectorMask`, `createShapeLayer`, `shouldUseShapeLayer`
+- [x] **Phase 3B**: Rasterization fallback with per-draw-op CTM for complex vectors
+- [x] **Download UI**: Shape layer count breakdown
+
+### Next Session (v4.1 plan)
+- [ ] Test with Canva, Figma, InDesign, Word PDFs to verify v4 fixes across creators
+- [ ] Validate shape layer rendering in Photoshop (vectorMask knot coordinates, vectorFill colors)
+- [ ] Tune `shouldUseShapeLayer` heuristic — may need to exclude more complex cases
+- [ ] Consider enabling "Clean up background" toggle by default now that vector layers are properly extracted
 - [ ] Improve font name resolution — enhance `resolveFont()` for more edge cases
 
 ### Backlog
 - [ ] Smart layer grouping (group related text + image layers)
-- [ ] Gradient detection for background regions
+- [ ] Gradient detection and gradient fill support for shape layers
 - [ ] Multiple font styles within a single TypeLayer (StyleRun arrays)
 - [ ] Adaptive segmentation depth for non-Canva PDF generators
+- [ ] Pattern/image fill support for shape layers
