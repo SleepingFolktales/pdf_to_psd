@@ -1,11 +1,11 @@
-<!-- PDF → PSD Converter v4.0 -->
-<!-- Four-phase pipeline: Segmentation → Classification → Shape Layers / Rasterization → Unified Z-Order Assembly -->
+<!-- PDF → PSD Converter v4.1 -->
+<!-- Four-phase pipeline with v4.1 refinements: z-order fix, solid background, vectorMask normalization, per-text z-index -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v4.0</title>
+<title>PDF → PSD Converter v4.1</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -1286,10 +1286,12 @@ function initApp(){
     let ci=0;
     let currentX=0,currentY=0;
 
+    // ag-psd quirk: normalize both axes by max(W,H), not W/H separately
+    const maxDim=Math.max(docWidth,docHeight);
     function toNorm(lx,ly){
       const px=ctm[0]*lx+ctm[2]*ly+ctm[4];
       const py=ctm[1]*lx+ctm[3]*ly+ctm[5];
-      return{nx:px/docWidth, ny:py/docHeight};
+      return{nx:px/maxDim, ny:py/maxDim};
     }
     function straightKnot(lx,ly){
       const{nx,ny}=toNorm(lx,ly);
@@ -2078,9 +2080,21 @@ function initApp(){
           ctx.fillText(b.text, PAD, Math.round(fs*0.9)+PAD);
           const tLeft=Math.floor(b.bx)-PAD;
           const tTop=Math.floor(b.by-fs*0.9)-PAD;
-          // Tag text with z-index from matching classified text group
-          const matchTg=textGroups.find(tg=>tg.zIndex!==undefined);
-          const textZ=matchTg?matchTg.zIndex:(2000+idx);
+          // Issue 4 fix: match text layer to closest text group by position
+          let textZ=2000+idx;
+          const sortedTG=[...textGroups].sort((a,b)=>a.zIndex-b.zIndex);
+          if(idx<sortedTG.length){
+            textZ=sortedTG[idx].zIndex;
+          }else{
+            // Fallback: find closest text group by CTM translation
+            let bestDist=Infinity;
+            for(const tg of textGroups){
+              const tOp=tg.group.drawOps.find(d=>d.type==='text');
+              if(!tOp||!tOp.ctmAtDraw) continue;
+              const dist=Math.hypot(tOp.ctmAtDraw[4]-b.bx,tOp.ctmAtDraw[5]-b.by);
+              if(dist<bestDist){bestDist=dist;textZ=tg.zIndex;}
+            }
+          }
           return {
             name:'T'+(idx+1)+': '+b.text.replace(/\n/g,' ').slice(0,30),
             top:tTop, left:tLeft,
@@ -2115,14 +2129,21 @@ function initApp(){
         // ── 9. UNIFIED Z-ORDER ASSEMBLY (Fix 2 — single sorted layer stack) ──
         setProgress(((pi+.85)/pages.length)*90,'Page '+pageNum+' — writing PSD…');
 
-        // Collect all layers with z-index, sort by z ascending (paint order), then reverse for PSD
+        // Issue 3 fix: solid background from G0 color (not baked page.render())
+        const bgFillColor=bgGroups.length>0&&bgGroups[0].color?bgGroups[0].color:{r:255,g:255,b:255};
+        const solidBgCanvas=document.createElement('canvas');
+        solidBgCanvas.width=bgCanvas.width;solidBgCanvas.height=bgCanvas.height;
+        const solidBgCtx=solidBgCanvas.getContext('2d');
+        solidBgCtx.fillStyle='rgb('+bgFillColor.r+','+bgFillColor.g+','+bgFillColor.b+')';
+        solidBgCtx.fillRect(0,0,solidBgCanvas.width,solidBgCanvas.height);
+
+        // Collect all layers with z-index, sort ascending (paint order)
         const allLayers=[...textLayers,...vecLayers,...imgLayers];
         allLayers.sort((a,b)=>(a._zIndex||0)-(b._zIndex||0));
-        // PSD convention: first child = topmost in panel = highest z
-        allLayers.reverse();
-        // Add background as bottommost layer
-        const bgLayer={name:'Background',top:0,left:0,canvas:bgCanvas};
-        allLayers.push(bgLayer);
+        // Issue 1 fix: ag-psd children[0]=bottommost. Ascending z is correct. DO NOT reverse.
+        // Add background as bottommost layer (index 0)
+        const bgLayer={name:'Background',top:0,left:0,canvas:solidBgCanvas};
+        allLayers.unshift(bgLayer);
 
         // Clean up internal z-index tags before PSD write
         for(const l of allLayers){ delete l._zIndex; delete l._type; }
@@ -2133,7 +2154,7 @@ function initApp(){
         };
 
         // ── Debug: PSD assembly ──
-        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.0 — unified z-order) ──`,'dbg-section');
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.1 — unified z-order, solid bg) ──`,'dbg-section');
         dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
         dbg(`  Layers: ${textLayers.length} text + ${vecLayers.length} vector (${shapeCount} shape + ${rasterCount} raster) + ${imgLayers.length} image + 1 bg = ${psd.children.length} total`);
         dbg(`  Layer stack (top→bottom in Photoshop):`);

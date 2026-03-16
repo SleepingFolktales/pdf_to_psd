@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v4.0 (Four-Phase Pipeline — Segmentation → Classification → Shape Layers / Rasterization → Unified Z-Order Assembly)
+## Current Version: v4.1 (Four-Phase Pipeline with Refinements — Z-Order Fix, Solid Background, VectorMask Normalization, Per-Text Z-Index)
 
 ---
 
@@ -182,6 +182,16 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 
 ## What We Did (Changelog)
 
+### v4.1 — Post-v4.0 Refinements (6 Issues from Postmortem)
+- **Issue 1 — Z-Order Inverted (Critical)**: Removed `.reverse()` call in PSD assembly. ag-psd `children[0]` = bottommost layer (painted first). Ascending z-order sort is now used directly without inversion. Background inserted at index 0 via `unshift()` instead of `push()`
+- **Issue 2 — VectorMask 1×1 Bounds (Critical)**: Fixed coordinate normalization in `pdfPathToPsdVectorMask` — both axes now normalized by `max(docWidth, docHeight)` instead of separate W/H division. This handles the ag-psd quirk for non-square documents (issue #44)
+- **Issue 3 — Background Contains Baked Content (High)**: Background layer is now a solid-color canvas generated from the `BACKGROUND_FILL` group's classified color (G0), instead of the full `page.render()` composite. Falls back to white if no background fill group found. The baked `bgCanvas` is still used for image extraction and color sampling
+- **Issue 4 — Text/Image Layers Missing Z-Indices (Medium)**: Text layers now get per-layer z-indices from matching Phase 1 text groups by rendering order. Falls back to position-based CTM matching when there are more text layers than groups. Image layers already used name-based matching from v4.0
+- **Issue 5 — Button BG Shape Bounds**: Linked to Issue 2 fix — should resolve after vectorMask normalization correction
+- **Issue 6 — Image Clip Regions Not Applied**: Deferred to v4.2 — requires deeper refactor of image extraction pipeline to incorporate Phase 1 clip data
+- **Version header**: Updated to v4.1
+- **Debug labels**: Assembly section now labeled "v4.1 — unified z-order, solid bg"
+
 ### v4.0 — Four-Phase Pipeline with Bug Fixes and Native PSD Shape Layers
 - **Bug Fix 1 — Transform Chain**: CTM now starts from `viewportTransform` and accumulates at ALL save/restore depths (0, 1, 2, 3), not just depth ≥2. Each draw operation snapshots `ctmAtDraw` — the fully resolved CTM at the moment of painting. `computeGroupBounds` and rasterization now use per-draw-op CTMs instead of a single group-level transform. This fixes the "tiny misplaced layers" bug where vector elements were rendered at wrong size/position
 - **Bug Fix 2 — Z-Order Interleaving**: All layers (text, vector, image) are now collected into a single array, each tagged with a `_zIndex` from the walker's emission order. The array is sorted by z ascending then reversed for PSD convention (first child = topmost in Photoshop panel). Background is always the bottommost layer. This fixes the "grouped by type" bug where layers were stacked as text→vector→image instead of respecting actual paint order
@@ -308,11 +318,20 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 - [x] **Phase 3B**: Rasterization fallback with per-draw-op CTM for complex vectors
 - [x] **Download UI**: Shape layer count breakdown
 
-### Next Session (v4.1 plan)
-- [ ] Test with Canva, Figma, InDesign, Word PDFs to verify v4 fixes across creators
-- [ ] Validate shape layer rendering in Photoshop (vectorMask knot coordinates, vectorFill colors)
+### Completed (v4.1)
+- [x] **Issue 1**: Z-order fix — removed `.reverse()`, ascending z-order with `unshift` for background
+- [x] **Issue 2**: VectorMask normalization — `max(W,H)` for both axes
+- [x] **Issue 3**: Solid background from G0 color instead of baked `page.render()`
+- [x] **Issue 4**: Per-text-layer z-index from Phase 1 groups (order-based + position fallback)
+- [x] **Issue 5**: Linked to Issue 2 fix
+
+### Next Session (v4.2 plan)
+- [ ] Test v4.1 with Grand Opening PDF — verify z-order, solid background, vectorMask bounds in Photoshop
+- [ ] Issue 6: Apply Phase 1 clip regions during image extraction for cleaner image separation
+- [ ] Round-trip test: write minimal shape layer PSD, read back, verify vectorMask knots survive
+- [ ] Test with Canva, Figma, InDesign, Word PDFs to verify fixes across creators
 - [ ] Tune `shouldUseShapeLayer` heuristic — may need to exclude more complex cases
-- [ ] Consider enabling "Clean up background" toggle by default now that vector layers are properly extracted
+- [ ] Consider enabling "Clean up background" toggle by default
 - [ ] Improve font name resolution — enhance `resolveFont()` for more edge cases
 
 ### Backlog
