@@ -1396,16 +1396,17 @@ function initApp(){
     const{group}=classifiedGroup;
     // Complex clips → rasterize fallback
     if(group.clips.length>1) return false;
-    // Only solid color fills/strokes → shape layer
+    // Must have at least one draw op with valid color
+    let hasValidColor=false;
     for(const drawOp of group.drawOps){
       if(drawOp.type==='fill'||drawOp.type==='fillStroke'){
-        if(!drawOp.fillColor) return false;
+        if(drawOp.fillColor){ hasValidColor=true; break; }
       }
       if(drawOp.type==='stroke'){
-        if(!drawOp.strokeColor) return false;
+        if(drawOp.strokeColor){ hasValidColor=true; break; }
       }
     }
-    return true;
+    return hasValidColor;
   }
 
   function createShapeLayer(classifiedGroup, docWidth, docHeight){
@@ -1424,47 +1425,52 @@ function initApp(){
     const vectorMask={paths:allPaths};
 
     // Build fill descriptor
-    let vectorFill=null;
-    if(drawOp.type==='fill'||drawOp.type==='fillStroke'){
-      const c=drawOp.fillColor;
-      if(c) vectorFill={type:'color',color:{r:c.r,g:c.g,b:c.b}};
+    let fillColor=null;
+    for(const dop of group.drawOps){
+      if((dop.type==='fill'||dop.type==='fillStroke')&&dop.fillColor){fillColor=dop.fillColor;break;}
     }
+    if(!fillColor) fillColor=group.fillColor||group.strokeColor||{r:0,g:0,b:0};
+    const vectorFill={type:'color',color:{r:fillColor.r,g:fillColor.g,b:fillColor.b}};
 
-    // Build stroke descriptor
+    // Build stroke descriptor — only if stroke color exists (ag-psd requires content.type)
     let vectorStroke=null;
     if(drawOp.type==='stroke'||drawOp.type==='fillStroke'){
       const c=drawOp.strokeColor;
-      const lw=drawOp.lineWidth||1;
-      const scaleX=Math.sqrt(ctm[0]**2+ctm[1]**2);
-      const pixelLW=lw*scaleX;
-      const gs=drawOp.gStateAtDraw||group.graphicsState||{};
-      vectorStroke={
-        strokeEnabled:true,
-        fillEnabled:drawOp.type==='fillStroke',
-        lineWidth:{value:pixelLW,units:'Points'},
-        lineCapType:['butt','round','square'][gs.lineCap||0]||'butt',
-        lineJoinType:['miter','round','bevel'][gs.lineJoin||0]||'miter',
-        miterLimit:gs.miterLimit||10,
-        lineAlignment:'center',
-      };
-      if(c) vectorStroke.content={type:'color',color:{r:c.r,g:c.g,b:c.b}};
+      if(c){
+        const lw=drawOp.lineWidth||1;
+        const scaleX=Math.sqrt(ctm[0]**2+ctm[1]**2);
+        const pixelLW=lw*scaleX;
+        const gs=drawOp.gStateAtDraw||group.graphicsState||{};
+        vectorStroke={
+          strokeEnabled:true,
+          fillEnabled:drawOp.type==='fillStroke',
+          lineWidth:{value:pixelLW,units:'Points'},
+          lineCapType:['butt','round','square'][gs.lineCap||0]||'butt',
+          lineJoinType:['miter','round','bevel'][gs.lineJoin||0]||'miter',
+          miterLimit:gs.miterLimit||10,
+          lineAlignment:'center',
+          content:{type:'color',color:{r:c.r,g:c.g,b:c.b}},
+        };
+      }
     }
 
     // Preview canvas (ag-psd requires pixel data)
     const previewCanvas=rasterizeForPreview(classifiedGroup,docWidth,docHeight);
 
     const gs=drawOp.gStateAtDraw||group.graphicsState||{};
-    return{
+    const layer={
       name:name,
       top:bounds.top, left:bounds.left,
       bottom:bounds.top+bounds.height, right:bounds.left+bounds.width,
-      vectorFill:vectorFill,
-      vectorStroke:vectorStroke,
       vectorMask:vectorMask,
+      vectorFill:vectorFill,
       canvas:previewCanvas,
       blendMode:gs.blendMode||'normal',
       opacity:typeof gs.opacity==='number'?Math.round(gs.opacity*255):255,
     };
+    // Only add vectorStroke if non-null — ag-psd crashes on null .type
+    if(vectorStroke) layer.vectorStroke=vectorStroke;
+    return layer;
   }
 
   // ── Phase 3B: Canvas Replay Rasterization (v4 — per-draw-op CTM) ──
