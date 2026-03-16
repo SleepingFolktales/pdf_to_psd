@@ -5,7 +5,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v4.1</title>
+<title>PDF → PSD Converter v4.1 - Normalization Fix</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -1286,16 +1286,17 @@ function initApp(){
     let ci=0;
     let currentX=0,currentY=0;
 
-    // ag-psd quirk: normalize both axes by max(W,H), not W/H separately
-    const maxDim=Math.max(docWidth,docHeight);
-    function toNorm(lx,ly){
-      const px=ctm[0]*lx+ctm[2]*ly+ctm[4];
-      const py=ctm[1]*lx+ctm[3]*ly+ctm[5];
-      return{nx:px/maxDim, ny:py/maxDim};
+    // ag-psd expects PIXEL coordinates — it normalizes to 0..1 internally before writing the PSD binary.
+    // Do NOT divide by docWidth/docHeight here; doing so causes double-normalization → 1×1 shapes.
+    function toPx(lx,ly){
+      return{
+        px:ctm[0]*lx+ctm[2]*ly+ctm[4],
+        py:ctm[1]*lx+ctm[3]*ly+ctm[5],
+      };
     }
     function straightKnot(lx,ly){
-      const{nx,ny}=toNorm(lx,ly);
-      return{linked:true,points:[ny,nx,ny,nx,ny,nx]};
+      const{px,py}=toPx(lx,ly);
+      return{linked:true,points:[py,px,py,px,py,px]};
     }
 
     for(const op of ops){
@@ -1321,15 +1322,15 @@ function initApp(){
           if(currentPath){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
-              const cp1n=toNorm(cp1x,cp1y);
-              prevKnot.points[4]=cp1n.ny;
-              prevKnot.points[5]=cp1n.nx;
+              const cp1p=toPx(cp1x,cp1y);
+              prevKnot.points[4]=cp1p.py;
+              prevKnot.points[5]=cp1p.px;
             }
-            const cp2n=toNorm(cp2x,cp2y);
-            const endn=toNorm(endX,endY);
+            const cp2p=toPx(cp2x,cp2y);
+            const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[cp2n.ny,cp2n.nx,endn.ny,endn.nx,endn.ny,endn.nx],
+              points:[cp2p.py,cp2p.px,endp.py,endp.px,endp.py,endp.px],
             });
           }
           currentX=endX;currentY=endY;
@@ -1341,15 +1342,15 @@ function initApp(){
           if(currentPath){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
-              const cpPrev=toNorm(currentX,currentY);
-              prevKnot.points[4]=cpPrev.ny;
-              prevKnot.points[5]=cpPrev.nx;
+              const cpPrev=toPx(currentX,currentY);
+              prevKnot.points[4]=cpPrev.py;
+              prevKnot.points[5]=cpPrev.px;
             }
-            const cp2n=toNorm(cp2x,cp2y);
-            const endn=toNorm(endX,endY);
+            const cp2p=toPx(cp2x,cp2y);
+            const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[cp2n.ny,cp2n.nx,endn.ny,endn.nx,endn.ny,endn.nx],
+              points:[cp2p.py,cp2p.px,endp.py,endp.px,endp.py,endp.px],
             });
           }
           currentX=endX;currentY=endY;
@@ -1361,14 +1362,14 @@ function initApp(){
           if(currentPath){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
-              const cp1n=toNorm(cp1x,cp1y);
-              prevKnot.points[4]=cp1n.ny;
-              prevKnot.points[5]=cp1n.nx;
+              const cp1p=toPx(cp1x,cp1y);
+              prevKnot.points[4]=cp1p.py;
+              prevKnot.points[5]=cp1p.px;
             }
-            const endn=toNorm(endX,endY);
+            const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[endn.ny,endn.nx,endn.ny,endn.nx,endn.ny,endn.nx],
+              points:[endp.py,endp.px,endp.py,endp.px,endp.py,endp.px],
             });
           }
           currentX=endX;currentY=endY;
