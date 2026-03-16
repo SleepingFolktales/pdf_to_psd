@@ -1,11 +1,11 @@
-<!-- PDF → PSD Converter v2.6 -->
-<!-- Direction A fix: Render text to offscreen canvases for non-zero bounds in Photoshop -->
+<!-- PDF → PSD Converter v3.0 -->
+<!-- Three-phase pipeline: Operator segmentation → Classification → Canvas replay rasterization -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v2.6</title>
+<title>PDF → PSD Converter v3.0</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -854,6 +854,458 @@ function initApp(){
     dbg('========================================================','dbg-section');
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // V3 THREE-PHASE PIPELINE: Operator Segmentation → Classification → Rasterization
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // ── PATH_OPS: sub-opcodes used inside constructPath's first argument ──
+  const PATH_OPS={moveTo:13,lineTo:14,curveTo:15,curveTo2:16,curveTo3:17,closePath:18,rectangle:19};
+
+  // ── Matrix helpers ────────────────────────────────────────────────────────
+  function mulMat(m1,m2){
+    return[
+      m1[0]*m2[0]+m1[2]*m2[1],
+      m1[1]*m2[0]+m1[3]*m2[1],
+      m1[0]*m2[2]+m1[2]*m2[3],
+      m1[1]*m2[2]+m1[3]*m2[3],
+      m1[0]*m2[4]+m1[2]*m2[5]+m1[4],
+      m1[1]*m2[4]+m1[3]*m2[5]+m1[5],
+    ];
+  }
+  function txPt(m,x,y){ return{x:m[0]*x+m[2]*y+m[4], y:m[1]*x+m[3]*y+m[5]}; }
+
+  // ── LayerType enum ────────────────────────────────────────────────────────
+  const LayerType={
+    IMAGE:'image', TEXT:'text',
+    VECTOR_FILL:'vector_fill', VECTOR_STROKE:'vector_stroke',
+    VECTOR_COMPOUND:'vector_compound', BACKGROUND_FILL:'background_fill',
+    BUTTON_BACKGROUND:'button_bg',
+  };
+
+  // ── Phase 1: Operator Group Segmentation ──────────────────────────────────
+  function segmentOperatorList(opList, viewportTransform){
+    const OPS=pdfjsLib.OPS;
+    const{fnArray,argsArray}=opList;
+    const groups=[];
+    let depth=0, currentGroup=null, zCounter=0;
+    const transformStack=[viewportTransform.slice()];
+    let currentTransform=viewportTransform.slice();
+    let fillColor=null, strokeColor=null;
+    let graphicsState={opacity:1,blendMode:'source-over',lineWidth:1,lineCap:0,lineJoin:0,miterLimit:10};
+    let pendingPath=null;
+
+    for(let i=0;i<fnArray.length;i++){
+      const op=fnArray[i], args=argsArray[i];
+      switch(op){
+        case OPS.save:{
+          depth++;
+          transformStack.push(currentTransform.slice());
+          if(depth===2&&!currentGroup){
+            currentGroup={opStart:i,opEnd:0,zIndex:zCounter,transform:[1,0,0,1,0,0],
+              clips:[],fillColor:null,strokeColor:null,
+              graphicsState:{...graphicsState},drawOps:[],_textAccumulator:null};
+          }
+          break;
+        }
+        case OPS.restore:{
+          if(depth===2&&currentGroup){
+            currentGroup.opEnd=i;
+            currentGroup.transform=currentTransform.slice();
+            if(currentGroup.drawOps.length>0){groups.push(currentGroup);zCounter++;}
+            currentGroup=null; pendingPath=null;
+          }
+          depth--;
+          currentTransform=transformStack.pop()||[1,0,0,1,0,0];
+          break;
+        }
+        case OPS.transform:{
+          currentTransform=mulMat(currentTransform,args);
+          if(currentGroup) currentGroup.transform=currentTransform.slice();
+          break;
+        }
+        case OPS.setFillRGBColor:{
+          const s=args[0]>1?1:255;
+          fillColor={r:Math.min(255,Math.round(args[0]*s)),g:Math.min(255,Math.round(args[1]*s)),b:Math.min(255,Math.round(args[2]*s))};
+          if(currentGroup) currentGroup.fillColor={...fillColor};
+          break;
+        }
+        case OPS.setFillGray:{
+          const s=args[0]>1?1:255;
+          const gv=Math.min(255,Math.round(args[0]*s));
+          fillColor={r:gv,g:gv,b:gv};
+          if(currentGroup) currentGroup.fillColor={...fillColor};
+          break;
+        }
+        case OPS.setFillCMYKColor:{
+          const c=args[0],m=args[1],y=args[2],k=args[3];
+          fillColor={r:Math.round(255*(1-c)*(1-k)),g:Math.round(255*(1-m)*(1-k)),b:Math.round(255*(1-y)*(1-k))};
+          if(currentGroup) currentGroup.fillColor={...fillColor};
+          break;
+        }
+        case OPS.setStrokeRGBColor:{
+          const s=args[0]>1?1:255;
+          strokeColor={r:Math.min(255,Math.round(args[0]*s)),g:Math.min(255,Math.round(args[1]*s)),b:Math.min(255,Math.round(args[2]*s))};
+          if(currentGroup) currentGroup.strokeColor={...strokeColor};
+          break;
+        }
+        case OPS.setGState:{
+          if(Array.isArray(args[0])){
+            for(const[key,value]of args[0]){
+              if(key==='ca') graphicsState.opacity=value;
+              else if(key==='BM') graphicsState.blendMode=value;
+              else if(key==='LW') graphicsState.lineWidth=value;
+              else if(key==='LC') graphicsState.lineCap=value;
+              else if(key==='LJ') graphicsState.lineJoin=value;
+              else if(key==='ML') graphicsState.miterLimit=value;
+            }
+          }
+          if(currentGroup) currentGroup.graphicsState={...graphicsState};
+          break;
+        }
+        case OPS.setLineWidth:{
+          graphicsState.lineWidth=args[0];
+          if(currentGroup) currentGroup.graphicsState.lineWidth=args[0];
+          break;
+        }
+        case OPS.clip: case OPS.eoClip:{
+          if(pendingPath&&currentGroup){
+            currentGroup.clips.push({
+              type:pendingPath.type,
+              ops:pendingPath.ops?pendingPath.ops.slice():undefined,
+              coords:pendingPath.coords.slice(),
+              rule:op===OPS.eoClip?'evenodd':'nonzero',
+              clipTransform:currentTransform.slice(),
+            });
+          }
+          pendingPath=null;
+          break;
+        }
+        case OPS.constructPath:{
+          const pathOps=args[0], coords=args[1];
+          const isRect=pathOps.length===1&&pathOps[0]===OPS.rectangle;
+          pendingPath={type:isRect?'rect':'path',ops:pathOps.slice(),coords:coords.slice()};
+          break;
+        }
+        case OPS.fill: case OPS.eoFill:{
+          if(currentGroup&&pendingPath){
+            currentGroup.drawOps.push({type:'fill',pathData:{...pendingPath},
+              fillColor:fillColor?{...fillColor}:null,
+              fillRule:op===OPS.eoFill?'evenodd':'nonzero'});
+          }
+          pendingPath=null; break;
+        }
+        case OPS.stroke:{
+          if(currentGroup&&pendingPath){
+            currentGroup.drawOps.push({type:'stroke',pathData:{...pendingPath},
+              strokeColor:strokeColor?{...strokeColor}:null,
+              lineWidth:graphicsState.lineWidth,lineCap:graphicsState.lineCap,
+              lineJoin:graphicsState.lineJoin,miterLimit:graphicsState.miterLimit});
+          }
+          pendingPath=null; break;
+        }
+        case OPS.fillStroke: case OPS.eoFillStroke:{
+          if(currentGroup&&pendingPath){
+            currentGroup.drawOps.push({type:'fillStroke',pathData:{...pendingPath},
+              fillColor:fillColor?{...fillColor}:null,
+              strokeColor:strokeColor?{...strokeColor}:null,
+              fillRule:(op===OPS.eoFillStroke)?'evenodd':'nonzero',
+              lineWidth:graphicsState.lineWidth});
+          }
+          pendingPath=null; break;
+        }
+        case OPS.paintImageXObject: case OPS.paintJpegXObject:{
+          if(currentGroup){
+            currentGroup.drawOps.push({type:'image',imageId:args[0]});
+          }
+          break;
+        }
+        case OPS.paintInlineImageXObject:{
+          if(currentGroup){
+            currentGroup.drawOps.push({type:'image',imageId:'inline_'+i});
+          }
+          break;
+        }
+        case OPS.beginText:{
+          if(currentGroup){
+            currentGroup._textAccumulator={items:[],font:null,fontSize:0,textMatrix:[1,0,0,1,0,0]};
+          }
+          break;
+        }
+        case OPS.setFont:{
+          if(currentGroup&&currentGroup._textAccumulator){
+            currentGroup._textAccumulator.font=args[0];
+            currentGroup._textAccumulator.fontSize=args[1];
+          }
+          break;
+        }
+        case OPS.setTextMatrix:{
+          if(currentGroup&&currentGroup._textAccumulator){
+            currentGroup._textAccumulator.textMatrix=args.slice();
+          }
+          break;
+        }
+        case OPS.showText: case OPS.showSpacedText:{
+          if(currentGroup&&currentGroup._textAccumulator){
+            currentGroup._textAccumulator.items.push({
+              glyphs:args[0],font:currentGroup._textAccumulator.font,
+              fontSize:currentGroup._textAccumulator.fontSize,
+              textMatrix:currentGroup._textAccumulator.textMatrix.slice()});
+          }
+          break;
+        }
+        case OPS.endText:{
+          if(currentGroup&&currentGroup._textAccumulator){
+            if(currentGroup._textAccumulator.items.length>0){
+              currentGroup.drawOps.push({type:'text',textItems:currentGroup._textAccumulator.items});
+            }
+            currentGroup._textAccumulator=null;
+          }
+          break;
+        }
+        case OPS.moveText:{
+          if(currentGroup&&currentGroup._textAccumulator){
+            const[dx,dy]=args;
+            const tm=currentGroup._textAccumulator.textMatrix;
+            tm[4]+=dx*tm[0]+dy*tm[2];
+            tm[5]+=dx*tm[1]+dy*tm[3];
+          }
+          break;
+        }
+      }
+    }
+    return groups;
+  }
+
+  // ── Phase 2: Group Classification ─────────────────────────────────────────
+
+  function computeGroupBounds(group, canvasWidth, canvasHeight){
+    const transform=group.transform;
+    let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
+    function expand(lx,ly){
+      const p=txPt(transform,lx,ly);
+      if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x;
+      if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y;
+    }
+    for(const drawOp of group.drawOps){
+      if(drawOp.type==='image'){expand(0,0);expand(1,0);expand(0,1);expand(1,1);continue;}
+      if(!drawOp.pathData)continue;
+      const{ops,coords}=drawOp.pathData;
+      let ci=0;
+      for(const pathOp of ops){
+        switch(pathOp){
+          case PATH_OPS.rectangle:{
+            const rx=coords[ci++],ry=coords[ci++],rw=coords[ci++],rh=coords[ci++];
+            expand(rx,ry);expand(rx+rw,ry);expand(rx,ry+rh);expand(rx+rw,ry+rh);break;
+          }
+          case PATH_OPS.moveTo: case PATH_OPS.lineTo:{expand(coords[ci++],coords[ci++]);break;}
+          case PATH_OPS.curveTo:{for(let j=0;j<3;j++)expand(coords[ci++],coords[ci++]);break;}
+          case PATH_OPS.curveTo2: case PATH_OPS.curveTo3:{for(let j=0;j<2;j++)expand(coords[ci++],coords[ci++]);break;}
+          case PATH_OPS.closePath:{break;}
+        }
+      }
+      if(drawOp.type==='stroke'||drawOp.type==='fillStroke'){
+        const lw=(drawOp.lineWidth||group.graphicsState.lineWidth)||1;
+        const scaleX=Math.sqrt(transform[0]**2+transform[1]**2);
+        const halfStroke=(lw*scaleX)/2;
+        minX-=halfStroke;minY-=halfStroke;maxX+=halfStroke;maxY+=halfStroke;
+      }
+    }
+    minX=Math.max(0,Math.floor(minX));minY=Math.max(0,Math.floor(minY));
+    maxX=Math.min(canvasWidth,Math.ceil(maxX));maxY=Math.min(canvasHeight,Math.ceil(maxY));
+    return{left:minX,top:minY,width:Math.max(0,maxX-minX),height:Math.max(0,maxY-minY)};
+  }
+
+  function describeShape(group){
+    const OPS=pdfjsLib.OPS;
+    const firstDraw=group.drawOps[0];
+    if(!firstDraw||!firstDraw.pathData)return'Shape';
+    const{ops}=firstDraw.pathData;
+    if(!ops)return'Shape';
+    const hasRect=ops.includes(OPS.rectangle);
+    const hasCurve=ops.includes(OPS.curveTo)||ops.includes(OPS.curveTo2)||ops.includes(OPS.curveTo3);
+    const hasClose=ops.includes(OPS.closePath);
+    const[a,b,c,d]=group.transform;
+    const isRotated=Math.abs(b)>0.01||Math.abs(c)>0.01;
+    if(hasRect&&!hasCurve&&!isRotated)return'Rect';
+    if(hasRect&&!hasCurve&&isRotated)return'Rotated Rect';
+    if(hasCurve&&hasClose)return'Closed Path';
+    if(hasCurve)return'Curve';
+    if(hasClose)return'Polygon';
+    return'Path';
+  }
+
+  function generateVectorName(group,bounds){
+    const color=group.fillColor||group.strokeColor;
+    const hex=color?'#'+[color.r,color.g,color.b].map(c=>c.toString(16).padStart(2,'0')).join(''):'';
+    const shape=describeShape(group);
+    const size=Math.round(bounds.width)+'×'+Math.round(bounds.height);
+    return(shape+' '+hex+' ('+size+')').trim();
+  }
+
+  function classifyGroup(group,canvasWidth,canvasHeight,allGroups,groupIndex){
+    const drawTypes=group.drawOps.map(d=>d.type);
+    const uniqueTypes=new Set(drawTypes);
+
+    if(uniqueTypes.has('image')){
+      const imageOp=group.drawOps.find(d=>d.type==='image');
+      return{layerType:LayerType.IMAGE,name:imageOp.imageId,needsRasterization:false};
+    }
+    if(uniqueTypes.has('text')&&!uniqueTypes.has('fill')&&!uniqueTypes.has('stroke')){
+      return{layerType:LayerType.TEXT,name:'Text',needsRasterization:false};
+    }
+
+    const bounds=computeGroupBounds(group,canvasWidth,canvasHeight);
+    const coverage=(bounds.width*bounds.height)/(canvasWidth*canvasHeight);
+
+    if(coverage>0.95&&group.zIndex===0&&group.drawOps.length===1&&group.drawOps[0].type==='fill'){
+      return{layerType:LayerType.BACKGROUND_FILL,name:'Background',color:group.fillColor,bounds,needsRasterization:false};
+    }
+
+    const isThickStroke=group.drawOps.some(d=>d.type==='stroke'&&d.lineWidth>20);
+    const nextGroup=allGroups[groupIndex+1];
+    const nextIsText=nextGroup&&nextGroup.drawOps.some(d=>d.type==='text');
+    if(isThickStroke&&nextIsText){
+      return{layerType:LayerType.BUTTON_BACKGROUND,name:'Button BG',bounds,needsRasterization:true};
+    }
+
+    if(group.drawOps.length>1&&!uniqueTypes.has('text')){
+      return{layerType:LayerType.VECTOR_COMPOUND,name:generateVectorName(group,bounds),bounds,needsRasterization:true};
+    }
+
+    const drawOp=group.drawOps[0];
+    if(drawOp&&(drawOp.type==='fill'||drawOp.type==='fillStroke')){
+      return{layerType:LayerType.VECTOR_FILL,name:generateVectorName(group,bounds),color:group.fillColor,bounds,needsRasterization:true};
+    }
+    if(drawOp&&drawOp.type==='stroke'){
+      return{layerType:LayerType.VECTOR_STROKE,name:generateVectorName(group,bounds),color:group.strokeColor,bounds,needsRasterization:true};
+    }
+    return{layerType:LayerType.VECTOR_FILL,name:'Vector Z'+group.zIndex,bounds,needsRasterization:true};
+  }
+
+  function classifyAllGroups(groups,canvasWidth,canvasHeight){
+    return groups.map((group,index)=>{
+      const classification=classifyGroup(group,canvasWidth,canvasHeight,groups,index);
+      return{...classification,group,zIndex:group.zIndex};
+    });
+  }
+
+  // ── Phase 3: Canvas Replay Rasterization ──────────────────────────────────
+
+  function replayPathOps(ctx,pathData){
+    const{ops,coords}=pathData;
+    let ci=0;
+    for(const op of ops){
+      switch(op){
+        case PATH_OPS.moveTo:{ctx.moveTo(coords[ci++],coords[ci++]);break;}
+        case PATH_OPS.lineTo:{ctx.lineTo(coords[ci++],coords[ci++]);break;}
+        case PATH_OPS.curveTo:{
+          ctx.bezierCurveTo(coords[ci++],coords[ci++],coords[ci++],coords[ci++],coords[ci++],coords[ci++]);break;
+        }
+        case PATH_OPS.curveTo2:{
+          const cp2x=coords[ci++],cp2y=coords[ci++],ex=coords[ci++],ey=coords[ci++];
+          ctx.quadraticCurveTo(cp2x,cp2y,ex,ey);break;
+        }
+        case PATH_OPS.curveTo3:{
+          const cp1x=coords[ci++],cp1y=coords[ci++],ex=coords[ci++],ey=coords[ci++];
+          ctx.bezierCurveTo(cp1x,cp1y,ex,ey,ex,ey);break;
+        }
+        case PATH_OPS.rectangle:{ctx.rect(coords[ci++],coords[ci++],coords[ci++],coords[ci++]);break;}
+        case PATH_OPS.closePath:{ctx.closePath();break;}
+      }
+    }
+  }
+
+  function rasterizeVectorGroup(classifiedGroup,canvasWidth,canvasHeight){
+    const{group,bounds}=classifiedGroup;
+    if(!bounds||bounds.width<=0||bounds.height<=0) return null;
+    const pad=2;
+    const layerWidth=Math.max(1,bounds.width+pad*2);
+    const layerHeight=Math.max(1,bounds.height+pad*2);
+    const offsetX=bounds.left-pad;
+    const offsetY=bounds.top-pad;
+
+    const canvas=document.createElement('canvas');
+    canvas.width=layerWidth; canvas.height=layerHeight;
+    const ctx=canvas.getContext('2d');
+
+    // Apply clip regions with their own transforms
+    if(group.clips.length>0){
+      for(const clip of group.clips){
+        ctx.save();
+        const ct=clip.clipTransform;
+        ctx.setTransform(ct[0],ct[1],ct[2],ct[3],ct[4]-offsetX,ct[5]-offsetY);
+        ctx.beginPath();
+        if(clip.type==='rect'&&clip.coords.length>=4){
+          ctx.rect(clip.coords[0],clip.coords[1],clip.coords[2],clip.coords[3]);
+        }else if(clip.ops){
+          replayPathOps(ctx,{ops:clip.ops,coords:clip.coords});
+        }
+        ctx.clip(clip.rule||'nonzero');
+      }
+    }
+
+    // Apply drawing transform
+    const t=group.transform;
+    ctx.setTransform(t[0],t[1],t[2],t[3],t[4]-offsetX,t[5]-offsetY);
+
+    // Graphics state
+    ctx.globalAlpha=group.graphicsState.opacity;
+    if(group.graphicsState.blendMode&&group.graphicsState.blendMode!=='source-over'){
+      try{ctx.globalCompositeOperation=group.graphicsState.blendMode;}catch(e){}
+    }
+    ctx.lineWidth=group.graphicsState.lineWidth;
+    ctx.lineCap=['butt','round','square'][group.graphicsState.lineCap]||'butt';
+    ctx.lineJoin=['miter','round','bevel'][group.graphicsState.lineJoin]||'miter';
+    ctx.miterLimit=group.graphicsState.miterLimit;
+
+    // Replay each drawing operation
+    for(const drawOp of group.drawOps){
+      if(drawOp.type==='fill'||drawOp.type==='fillStroke'){
+        if(drawOp.fillColor){
+          const{r,g,b}=drawOp.fillColor;
+          ctx.fillStyle='rgb('+r+','+g+','+b+')';
+        }
+        if(drawOp.strokeColor){
+          const{r,g,b}=drawOp.strokeColor;
+          ctx.strokeStyle='rgb('+r+','+g+','+b+')';
+        }
+        if(drawOp.lineWidth) ctx.lineWidth=drawOp.lineWidth;
+        ctx.beginPath();
+        replayPathOps(ctx,drawOp.pathData);
+        ctx.fill(drawOp.fillRule||'nonzero');
+        if(drawOp.type==='fillStroke') ctx.stroke();
+      }else if(drawOp.type==='stroke'){
+        if(drawOp.strokeColor){
+          const{r,g,b}=drawOp.strokeColor;
+          ctx.strokeStyle='rgb('+r+','+g+','+b+')';
+        }
+        if(drawOp.lineWidth) ctx.lineWidth=drawOp.lineWidth;
+        if(drawOp.lineCap!==undefined) ctx.lineCap=['butt','round','square'][drawOp.lineCap]||'butt';
+        if(drawOp.lineJoin!==undefined) ctx.lineJoin=['miter','round','bevel'][drawOp.lineJoin]||'miter';
+        ctx.beginPath();
+        replayPathOps(ctx,drawOp.pathData);
+        ctx.stroke();
+      }
+    }
+
+    // Restore clip saves
+    for(let i=0;i<group.clips.length;i++) ctx.restore();
+
+    return{canvas,left:offsetX,top:offsetY,width:layerWidth,height:layerHeight};
+  }
+
+  function rasterizeVectorGroups(classifiedGroups,canvasWidth,canvasHeight){
+    return classifiedGroups.map(cg=>{
+      if(!cg.needsRasterization) return cg;
+      const pixelData=rasterizeVectorGroup(cg,canvasWidth,canvasHeight);
+      return{...cg,pixelData};
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // END V3 THREE-PHASE PIPELINE
+  // ══════════════════════════════════════════════════════════════════════════
+
   // ── Image extraction (walks PDF operator list, tracks CTM) ─────────────────
   // Returns an array of {name, left, top, right, bottom, width, height}
   // for every embedded image on the page (photos, logos, decorations).
@@ -1200,17 +1652,51 @@ function initApp(){
           continue;
         }
 
-        // ── 3. Extract embedded images + text colors from operator list ──
-        //    CRITICAL: runs BEFORE step 5 modifies the canvas.
-        //    Extracts per-text-block fill colors directly from the PDF op stream.
-        //    NOTE (v2.6): operator-extracted bounds removed — they used wrong coordinate
-        //    space (missing CTM). getTextContent positions are already correct.
-        setProgress(((pi+.55)/pages.length)*90,'Page '+pageNum+' — extracting images & colors…');
+        // ── 3. V3 THREE-PHASE PIPELINE: segment → classify → rasterize ──
+        setProgress(((pi+.45)/pages.length)*90,'Page '+pageNum+' — segmenting operators…');
         const {images:extractedImgs, textColors:opListColors}=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height,pageNum);
+        const opList=await page.getOperatorList();
 
-        // ── 4. Apply colors: op-list first (always), canvas sampling as override ─
-        // Assign by ORDER: op list text blocks are emitted in the same sequence as
-        // getTextContent items (both follow PDF rendering order).
+        // Phase 1: Segment operator list into visual groups
+        const opGroups=segmentOperatorList(opList,vp.transform);
+        log('Page '+pageNum+': '+opGroups.length+' operator group(s) segmented','ok');
+        dbg(`── PAGE ${pageNum} PHASE 1: SEGMENTATION ──`,'dbg-section');
+        dbg(`  Total groups: ${opGroups.length}`);
+        for(let gi=0;gi<Math.min(opGroups.length,30);gi++){
+          const g=opGroups[gi];
+          const types=g.drawOps.map(d=>d.type).join('+');
+          dbg(`  G${gi}: ops[${g.opStart}–${g.opEnd}] z=${g.zIndex} draw=[${types}] clips=${g.clips.length}`,'dbg-dim');
+        }
+
+        // Phase 2: Classify each group
+        setProgress(((pi+.55)/pages.length)*90,'Page '+pageNum+' — classifying layers…');
+        const classified=classifyAllGroups(opGroups,bgCanvas.width,bgCanvas.height);
+        const vectorGroups=classified.filter(c=>c.needsRasterization);
+        const imageGroups=classified.filter(c=>c.layerType===LayerType.IMAGE);
+        const textGroups=classified.filter(c=>c.layerType===LayerType.TEXT);
+        const bgGroups=classified.filter(c=>c.layerType===LayerType.BACKGROUND_FILL);
+        log('Page '+pageNum+': classified — '+vectorGroups.length+' vector, '+imageGroups.length+' image, '+textGroups.length+' text, '+bgGroups.length+' background','ok');
+        dbg(`── PAGE ${pageNum} PHASE 2: CLASSIFICATION ──`,'dbg-section');
+        for(let ci2=0;ci2<classified.length;ci2++){
+          const c=classified[ci2];
+          const bStr=c.bounds?` bounds=(${c.bounds.left},${c.bounds.top} ${c.bounds.width}×${c.bounds.height})`:'';
+          dbg(`  G${ci2}: ${c.layerType} "${c.name}" raster=${c.needsRasterization}${bStr}`,(c.needsRasterization?'dbg-img':'dbg-dim'));
+        }
+
+        // Phase 3: Rasterize vector groups to isolated canvases
+        setProgress(((pi+.65)/pages.length)*90,'Page '+pageNum+' — rasterizing '+vectorGroups.length+' vector layer(s)…');
+        const processedGroups=rasterizeVectorGroups(classified,bgCanvas.width,bgCanvas.height);
+        const rasterizedCount=processedGroups.filter(c=>c.pixelData).length;
+        log('Page '+pageNum+': '+rasterizedCount+' vector layer(s) rasterized','ok');
+        dbg(`── PAGE ${pageNum} PHASE 3: RASTERIZATION ──`,'dbg-section');
+        dbg(`  Rasterized: ${rasterizedCount} vector groups`);
+        for(const pg of processedGroups){
+          if(pg.pixelData){
+            dbg(`  ${pg.name}: canvas ${pg.pixelData.width}×${pg.pixelData.height} at (${pg.pixelData.left},${pg.pixelData.top})`,'dbg-img');
+          }
+        }
+
+        // ── 4. Apply text colors from operator list ──
         for(let ti=0;ti<rawItems.length;ti++){
           if(ti<opListColors.length) rawItems[ti].color=opListColors[ti];
         }
@@ -1220,27 +1706,20 @@ function initApp(){
           const it=rawItems[ti]; const matched=ti<opListColors.length;
           dbg(`  T${ti+1}: "${it.str.slice(0,30)}" → rgb(${it.color.r},${it.color.g},${it.color.b}) ${matched?'(op-list)':'(default black)'}`,(matched?'dbg-ok':'dbg-warn'));
         }
-
-        // Canvas pixel sampling overrides op-list colors (more accurate for blended/gradient text)
         if(doColors){
           for(const it of rawItems) it.color=sampleColor(bgCtx,it.x,it.y,it.width,it.height);
           log('Page '+pageNum+': colors sampled (canvas override)');
-          dbg(`── PAGE ${pageNum} CANVAS COLOR OVERRIDE ──`,'dbg-section');
-          for(let ti=0;ti<Math.min(rawItems.length,20);ti++){
-            const it=rawItems[ti];
-            dbg(`  T${ti+1}: "${it.str.slice(0,30)}" → rgb(${it.color.r},${it.color.g},${it.color.b})`,'dbg-dim');
-          }
         }
+
+        // ── 5. Build image layers from classified image groups ──
         const imgLayers=[];
         const seenBounds=[];
         for(let k=0;k<extractedImgs.length;k++){
           const img=extractedImgs[k];
-          // Clamp to canvas bounds
           const cl=Math.max(0,img.left), ct=Math.max(0,img.top);
           const cr=Math.min(bgCanvas.width,img.right), cb=Math.min(bgCanvas.height,img.bottom);
           const cw=cr-cl, ch=cb-ct;
           if(cw<=0||ch<=0) continue;
-          // Dedup: skip if nearly identical bounds already extracted
           const isDupe=seenBounds.some(s=>Math.abs(s[0]-cl)<5&&Math.abs(s[1]-ct)<5&&Math.abs(s[2]-cr)<5&&Math.abs(s[3]-cb)<5);
           if(isDupe) continue;
           seenBounds.push([cl,ct,cr,cb]);
@@ -1250,154 +1729,136 @@ function initApp(){
           imgLayers.push({name:'IMG '+(k+1)+' ('+cw+'×'+ch+')',top:ct,left:cl,bottom:cb,right:cr,canvas:c});
         }
         dbg(`── PAGE ${pageNum} IMAGE LAYERS ──`,'dbg-section');
-        dbg(`  Raw candidates: ${extractedImgs.length}`);
-        dbg(`  After dedup/clamp: ${imgLayers.length}`,(imgLayers.length?'dbg-ok':'dbg-warn'));
-        for(const il of imgLayers){
-          dbg(`  ${il.name}: (${il.left},${il.top})→(${il.right},${il.bottom})`,'dbg-img');
-        }
-        if(imgLayers.length) log('Page '+pageNum+': '+imgLayers.length+' image layer(s) extracted','ok');
-        else if(extractedImgs.length) log('Page '+pageNum+': '+extractedImgs.length+' image candidate(s) but all filtered out','warn');
+        dbg(`  Extracted: ${imgLayers.length} image layer(s)`,(imgLayers.length?'dbg-ok':'dbg-warn'));
 
-        // ── 5. Clean up background — cut out text & image regions ─────────
-        //    clearRect → transparent holes.  In the final PSD composite:
-        //      • TypeLayers fill the text holes (Photoshop renders them)
-        //      • Image pixel-layers fill the image holes
-        //      • Background shows only base design (shapes, borders, fills)
+        // ── 6. Build vector layers from rasterized groups ──
+        const vecLayers=[];
+        for(const pg of processedGroups){
+          if(!pg.pixelData) continue;
+          vecLayers.push({
+            name:pg.name,
+            top:pg.pixelData.top, left:pg.pixelData.left,
+            canvas:pg.pixelData.canvas,
+            blendMode:'normal',
+            opacity:Math.round((pg.group.graphicsState.opacity||1)*255),
+          });
+        }
+        dbg(`── PAGE ${pageNum} VECTOR LAYERS ──`,'dbg-section');
+        dbg(`  Total: ${vecLayers.length} vector layer(s)`,(vecLayers.length?'dbg-ok':'dbg-dim'));
+        for(const vl of vecLayers){
+          dbg(`  ${vl.name}: top=${vl.top} left=${vl.left} canvas=${vl.canvas.width}×${vl.canvas.height}`,'dbg-img');
+        }
+
+        // ── 7. Clean up background — cut out text, image, and vector regions ──
         if(doErase){
-          // Cut text regions (4 px padding around each glyph run for clean edges)
           for(const it of rawItems){
-            bgCtx.clearRect(
-              Math.floor(it.x)-4,
-              Math.floor(it.y)-4,
-              Math.ceil(it.width)+8,
-              Math.ceil(it.height)+8
-            );
+            bgCtx.clearRect(Math.floor(it.x)-4,Math.floor(it.y)-4,Math.ceil(it.width)+8,Math.ceil(it.height)+8);
           }
-          // Cut image regions (they now live in their own layers)
           for(const il of imgLayers){
             bgCtx.clearRect(il.left,il.top,il.right-il.left,il.bottom-il.top);
           }
-          log('Page '+pageNum+': background cleaned — '+rawItems.length+' text + '+imgLayers.length+' image region(s) cut');
+          for(const vl of vecLayers){
+            bgCtx.clearRect(Math.max(0,vl.left),Math.max(0,vl.top),vl.canvas.width,vl.canvas.height);
+          }
+          log('Page '+pageNum+': background cleaned — '+rawItems.length+' text + '+imgLayers.length+' image + '+vecLayers.length+' vector region(s) cut');
           dbg(`── PAGE ${pageNum} BACKGROUND CLEANUP ──`,'dbg-section');
-          dbg(`  clearRect text regions: ${rawItems.length} (4px padding each)`);
-          if(rawItems.length>0){
-            const first=rawItems[0];
-            dbg(`    Example T1: clearRect(${Math.floor(first.x)-4}, ${Math.floor(first.y)-4}, ${Math.ceil(first.width)+8}, ${Math.ceil(first.height)+8})`,'dbg-dim');
-            dbg(`    Original pos: baseline=(${first.bx.toFixed(0)},${first.by.toFixed(0)}) fontSize=${first.fontSize.toFixed(1)} eraseH=${first.height.toFixed(1)}`,'dbg-dim');
-          }
-          dbg(`  clearRect image regions: ${imgLayers.length}`);
-          for(const il of imgLayers){
-            dbg(`    ${il.name}: clearRect(${il.left}, ${il.top}, ${il.right-il.left}, ${il.bottom-il.top})`,'dbg-dim');
-          }
+          dbg(`  clearRect: ${rawItems.length} text, ${imgLayers.length} image, ${vecLayers.length} vector regions`);
         }
 
-            // ── 6. Merge into TypeLayer blocks ───────────────────────────────
-            let blocks;
-            if(doMerge){
-              blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
-              log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
-            }else{
-              blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,tWidth:it.width,fontName:it.fontName,fontSize:it.fontSize,color:it.color,isRotated:it.isRotated,cosA:it.cosA,sinA:it.sinA}));
-              log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
-            }
-
-            // ── Debug: merged text blocks ──
-            dbg(`── PAGE ${pageNum} TEXT LAYERS (${doMerge?'merged':'unmerged'}) ──`,'dbg-section');
-            for(let bi=0;bi<blocks.length;bi++){
-              const b=blocks[bi];
-              const preview=b.text.replace(/\n/g,'\\n').slice(0,60);
-              const rotTag=b.isRotated?' ROT':'';
-              dbg(`  T${bi+1}: "${preview}" font=${b.fontName} size=${b.fontSize.toFixed(1)} rgb(${b.color.r},${b.color.g},${b.color.b}) pos=(${b.bx.toFixed(0)},${b.by.toFixed(0)})${rotTag}`);
-            }
-
-            // ── 7. Assemble PSD (v2.6 — Direction A: rasterized canvas + TypeLayer) ──
-            // ag-psd requires a `canvas` on every layer for non-zero bounds.
-            // We render each text block to an offscreen canvas AND set the `text`
-            // property so Photoshop sees it as an editable TypeLayer with a
-            // rasterized preview.  `invalidateTextLayers` is NOT set — Photoshop
-            // uses our pixel data as-is and offers "Update" if the font is available.
-            setProgress(((pi+.85)/pages.length)*90,'Page '+pageNum+' — writing PSD…');
-
-            const PAD=4; // padding around rendered text to avoid clipping descenders/ascenders
-            const textLayers=blocks.map((b,idx)=>{
-              const fs=b.fontSize;
-              const tw=b.tWidth||fs*b.text.length*0.6;
-              // Canvas size: text width + padding, font height * 1.4 (ascenders+descenders) + padding
-              const cW=Math.ceil(tw)+PAD*2;
-              const cH=Math.ceil(fs*1.4)+PAD*2;
-              // Render text to offscreen canvas
-              const tc=document.createElement('canvas');
-              tc.width=cW; tc.height=cH;
-              const ctx=tc.getContext('2d');
-              ctx.clearRect(0,0,cW,cH);
-              ctx.font=fs+'px sans-serif';
-              ctx.fillStyle='rgb('+b.color.r+','+b.color.g+','+b.color.b+')';
-              ctx.textBaseline='alphabetic';
-              // Draw at PAD from left, baseline at ~90% of font size + PAD from top
-              ctx.fillText(b.text, PAD, Math.round(fs*0.9)+PAD);
-              // top/left: where the canvas top-left sits in the document
-              // ag-psd derives bottom/right from canvas dimensions — do NOT set them
-              const tLeft=Math.floor(b.bx)-PAD;
-              const tTop=Math.floor(b.by-fs*0.9)-PAD;
-              return {
-                name:'T'+(idx+1)+': '+b.text.replace(/\n/g,' ').slice(0,30),
-                top:tTop, left:tLeft,
-                canvas:tc,
-                text:{
-                  text:b.text,
-                  transform: b.isRotated
-                    ? [b.cosA, b.sinA, -b.sinA, b.cosA, b.bx, b.by]
-                    : [1,0,0,1,b.bx,b.by],
-                  style:{ font:{name:b.fontName}, fontSize:fs, fillColor:b.color },
-                },
-              };
-            });
-
-            // Layer order (top→bottom): text → images → background
-            const bgLayer={name:'Background',top:0,left:0,canvas:bgCanvas};
-            const psd={
-              width:bgCanvas.width, height:bgCanvas.height,
-              children:[...textLayers,...imgLayers,bgLayer],
-            };
-
-            // ── Debug: PSD assembly ──
-            dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v2.6 — canvas+text) ──`,'dbg-section');
-            dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
-            dbg(`  Layer stack (top→bottom in Photoshop):`);
-            for(let li=0;li<psd.children.length;li++){
-              const ch=psd.children[li];
-              const type=ch.text?'TypeLayer+Canvas':'Pixel';
-              const cw=ch.canvas?ch.canvas.width:0, chh=ch.canvas?ch.canvas.height:0;
-              dbg(`    [${li}] ${type}: "${ch.name}" top=${ch.top} left=${ch.left} canvas=${cw}×${chh} ${ch.text?'transform=['+ch.text.transform.map(v=>v.toFixed(1)).join(',')+']':''}`,(ch.text?'dbg-ok':'dbg-img'));
-            }
-            dbg(`  writePsd options: noBackground=true (invalidateTextLayers NOT set)`);
-
-            const buf=agPsd.writePsd(psd,{generateThumbnail:false,noBackground:true});
-            const blob=new Blob([buf],{type:'application/octet-stream'});
-            const base=pdfFile.name.replace(/\.pdf$/i,'');
-            const fn=pages.length===1?base+'.psd':base+'_p'+pageNum+'.psd';
-            const sizeMB=(blob.size/1048576).toFixed(2);
-
-            psdResults.push({filename:fn,blob,pageNum,sizeMB,textCount:blocks.length,imgCount:imgLayers.length});
-            log('Page '+pageNum+': ✓ '+sizeMB+' MB — '+blocks.length+' text + '+imgLayers.length+' image layer(s)','ok');
-
-          }catch(err){
-            log('Page '+pageNum+': ERROR — '+err.message,'err');
-            console.error('Conversion error p'+pageNum,err);
-          }
+        // ── 8. Merge into TypeLayer blocks ──
+        let blocks;
+        if(doMerge){
+          blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
+          log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
+        }else{
+          blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,tWidth:it.width,fontName:it.fontName,fontSize:it.fontSize,color:it.color,isRotated:it.isRotated,cosA:it.cosA,sinA:it.sinA}));
+          log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
+        }
+        dbg(`── PAGE ${pageNum} TEXT LAYERS (${doMerge?'merged':'unmerged'}) ──`,'dbg-section');
+        for(let bi=0;bi<blocks.length;bi++){
+          const b=blocks[bi];
+          const preview=b.text.replace(/\n/g,'\\n').slice(0,60);
+          dbg(`  T${bi+1}: "${preview}" font=${b.fontName} size=${b.fontSize.toFixed(1)} rgb(${b.color.r},${b.color.g},${b.color.b}) pos=(${b.bx.toFixed(0)},${b.by.toFixed(0)})`);
         }
 
-        dbg(`════════════════════════════════════════`,'dbg-section');
-        dbg(`CONVERSION COMPLETE: ${psdResults.length} file(s)`,'dbg-section');
-        dbg(`════════════════════════════════════════`,'dbg-section');
-        for(const r of psdResults){
-          dbg(`  ${r.filename}: ${r.sizeMB} MB, ${r.textCount} text + ${r.imgCount||0} image layer(s)`);
+        // ── 9. Assemble PSD (v3.0 — unified layer stack with vector layers) ──
+        setProgress(((pi+.85)/pages.length)*90,'Page '+pageNum+' — writing PSD…');
+
+        const PAD=4;
+        const textLayers=blocks.map((b,idx)=>{
+          const fs=b.fontSize;
+          const tw=b.tWidth||fs*b.text.length*0.6;
+          const cW=Math.ceil(tw)+PAD*2;
+          const cH=Math.ceil(fs*1.4)+PAD*2;
+          const tc=document.createElement('canvas');
+          tc.width=cW; tc.height=cH;
+          const ctx=tc.getContext('2d');
+          ctx.clearRect(0,0,cW,cH);
+          ctx.font=fs+'px sans-serif';
+          ctx.fillStyle='rgb('+b.color.r+','+b.color.g+','+b.color.b+')';
+          ctx.textBaseline='alphabetic';
+          ctx.fillText(b.text, PAD, Math.round(fs*0.9)+PAD);
+          const tLeft=Math.floor(b.bx)-PAD;
+          const tTop=Math.floor(b.by-fs*0.9)-PAD;
+          return {
+            name:'T'+(idx+1)+': '+b.text.replace(/\n/g,' ').slice(0,30),
+            top:tTop, left:tLeft,
+            canvas:tc,
+            text:{
+              text:b.text,
+              transform: b.isRotated
+                ? [b.cosA, b.sinA, -b.sinA, b.cosA, b.bx, b.by]
+                : [1,0,0,1,b.bx,b.by],
+              style:{ font:{name:b.fontName}, fontSize:fs, fillColor:b.color },
+            },
+          };
+        });
+
+        // Layer order (top→bottom in Photoshop): text → vector → images → background
+        const bgLayer={name:'Background',top:0,left:0,canvas:bgCanvas};
+        const psd={
+          width:bgCanvas.width, height:bgCanvas.height,
+          children:[...textLayers,...vecLayers,...imgLayers,bgLayer],
+        };
+
+        // ── Debug: PSD assembly ──
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v3.0 — three-phase pipeline) ──`,'dbg-section');
+        dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
+        dbg(`  Layers: ${textLayers.length} text + ${vecLayers.length} vector + ${imgLayers.length} image + 1 bg = ${psd.children.length} total`);
+        dbg(`  Layer stack (top→bottom in Photoshop):`);
+        for(let li=0;li<psd.children.length;li++){
+          const ch=psd.children[li];
+          const type=ch.text?'TypeLayer+Canvas':(ch.blendMode?'Vector':'Pixel');
+          const cw=ch.canvas?ch.canvas.width:0, chh=ch.canvas?ch.canvas.height:0;
+          dbg(`    [${li}] ${type}: "${ch.name}" top=${ch.top} left=${ch.left} canvas=${cw}×${chh} ${ch.text?'transform=['+ch.text.transform.map(v=>v.toFixed(1)).join(',')+']':''}`,(ch.text?'dbg-ok':'dbg-img'));
         }
-        setProgress(100,'Done — '+psdResults.length+' file(s) ready');
-        if(psdResults.length) buildDownloadUI();
-        else log('No pages converted successfully.','err');
-        converting=false; $('convert-btn').disabled=false;
+
+        const buf=agPsd.writePsd(psd,{generateThumbnail:false,noBackground:true});
+        const blob=new Blob([buf],{type:'application/octet-stream'});
+        const base=pdfFile.name.replace(/\.pdf$/i,'');
+        const fn=pages.length===1?base+'.psd':base+'_p'+pageNum+'.psd';
+        const sizeMB=(blob.size/1048576).toFixed(2);
+
+        psdResults.push({filename:fn,blob,pageNum,sizeMB,textCount:blocks.length,imgCount:imgLayers.length,vecCount:vecLayers.length});
+        log('Page '+pageNum+': ✓ '+sizeMB+' MB — '+blocks.length+' text + '+vecLayers.length+' vector + '+imgLayers.length+' image layer(s)','ok');
+
+      }catch(err){
+        log('Page '+pageNum+': ERROR — '+err.message,'err');
+        console.error('Conversion error p'+pageNum,err);
       }
+    }
+
+    dbg(`════════════════════════════════════════`,'dbg-section');
+    dbg(`CONVERSION COMPLETE: ${psdResults.length} file(s)`,'dbg-section');
+    dbg(`════════════════════════════════════════`,'dbg-section');
+    for(const r of psdResults){
+      dbg(`  ${r.filename}: ${r.sizeMB} MB, ${r.textCount} text + ${r.imgCount||0} image + ${r.vecCount||0} vector layer(s)`);
+    }
+    setProgress(100,'Done — '+psdResults.length+' file(s) ready');
+    if(psdResults.length) buildDownloadUI();
+    else log('No pages converted successfully.','err');
+    converting=false; $('convert-btn').disabled=false;
+  }
 
       // ── Download UI ────────────────────────────────────────────────────────────
       function buildDownloadUI(){
@@ -1405,7 +1866,9 @@ function initApp(){
         psdResults.forEach(r=>{
           const item=document.createElement('div'); item.className='dl-item';
           const imgNote=r.imgCount?' + '+r.imgCount+' image':'';
-          item.innerHTML='<div class="dl-info"><div class="dl-name">'+r.filename+'</div><div class="dl-meta">'+r.sizeMB+' MB · '+r.textCount+' text'+imgNote+' layer'+(r.textCount+r.imgCount!==1?'s':'')+'</div></div>';
+          const vecNote=r.vecCount?' + '+r.vecCount+' vector':'';
+          const totalLayers=(r.textCount||0)+(r.imgCount||0)+(r.vecCount||0);
+          item.innerHTML='<div class="dl-info"><div class="dl-name">'+r.filename+'</div><div class="dl-meta">'+r.sizeMB+' MB · '+r.textCount+' text'+vecNote+imgNote+' layer'+(totalLayers!==1?'s':'')+'</div></div>';
           const btn=document.createElement('button'); btn.className='btn btn-primary btn-sm'; btn.textContent='↓ Download';
           btn.onclick=()=>saveAs(r.blob,r.filename); item.appendChild(btn); list.appendChild(item);
         });

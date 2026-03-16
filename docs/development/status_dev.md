@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v2.6 (Direction A — Rasterized Canvas + TypeLayer Metadata)
+## Current Version: v3.0 (Three-Phase Pipeline — Operator Segmentation → Classification → Canvas Replay Rasterization)
 
 ---
 
@@ -182,6 +182,17 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 
 ## What We Did (Changelog)
 
+### v3.0 — Three-Phase Vector Layer Extraction Pipeline
+- **Architecture**: New three-phase pipeline walks the PDF.js operator list, segments it into discrete visual groups by save/restore depth, classifies each group, and rasterizes vector groups to isolated transparent canvases
+- **Phase 1 — Operator Group Segmentation** (`segmentOperatorList`): Single-pass scan of `fnArray`/`argsArray` tracking save/restore depth. Each depth-2 save/restore cycle = one visual element. Accumulates transforms (`mulMat`), colors, clips (with `clipTransform`), graphics state, and terminal draw ops (fill/stroke/image/text)
+- **Phase 2 — Group Classification** (`classifyAllGroups`): Classifies each group as `IMAGE`, `TEXT`, `VECTOR_FILL`, `VECTOR_STROKE`, `VECTOR_COMPOUND`, `BACKGROUND_FILL`, or `BUTTON_BACKGROUND`. Computes bounding boxes via `computeGroupBounds` (applies full transform chain to path coordinates). Generates descriptive layer names with shape type, color hex, and dimensions
+- **Phase 3 — Canvas Replay Rasterization** (`rasterizeVectorGroups`): For each vector group, creates a bounding-box-sized offscreen canvas. Applies clip regions with their own transforms, sets the drawing transform via `ctx.setTransform()`, then replays path operations (`replayPathOps`) mapping PDF operators → Canvas 2D API (moveTo, lineTo, bezierCurveTo, rect, fill, stroke). Produces isolated transparent pixel layers
+- **PSD Assembly**: Unified layer stack ordered by z-index: text → vector → images → background. Vector layers are pixel layers with correct position/bounds. Text layers retain Direction A pattern (canvas + TypeLayer metadata). Download UI now shows vector layer counts
+- **New helper functions**: `mulMat` (matrix multiply), `txPt` (transform point), `PATH_OPS` constants, `describeShape`, `generateVectorName`, `computeGroupBounds`
+- **Background cleanup**: Now also clears vector regions when "Clean up background" is enabled
+- **Debug logging**: Comprehensive per-phase debug output — segmentation groups, classification results, rasterization targets, and unified PSD assembly manifest
+- **RESULT**: Vector shapes (colored rectangles, rotated polygons, bezier decorations, button backgrounds) now extracted as independent PSD layers instead of being baked into the monolithic background
+
 ### v2.6 — Direction A: Rasterized Canvas + TypeLayer Metadata (SUCCESS)
 - **Core Fix**: Each text block renders to an offscreen canvas (`document.createElement('canvas')`) with `fillText()` providing pixel data that ag-psd uses to derive non-zero bounds (lines ~1319-1352)
 - **TypeLayer Objects**: Now have both `canvas` AND `text` properties — Photoshop sees editable TypeLayer metadata while ag-psd gets the pixel data it needs for bounds calculation
@@ -270,14 +281,23 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 - [x] **Remove broken operator bounds:** Deleted the `textBounds` extraction from `extractPageImages()` — it was redundant and used wrong coordinate space
 - [x] Remove `invalidateTextLayers: true` from `writePsd()` call — was actively harmful
 
-### Next Session (v2.7 plan)
-- [ ] Test with more PDFs (Figma, InDesign, Word exports) to verify v2.6 fix works across different PDF creators
-- [ ] Verify color extraction works across different PDF creators (Canva, Figma, InDesign, Word)
-- [ ] Consider enabling "Clean up background" toggle by default now that text layers render correctly
-- [ ] Improve font name resolution — enhance `resolveFont()` to handle more edge cases and font formats
+### Completed (v3.0)
+- [x] **Three-phase vector extraction pipeline**: Segment → Classify → Rasterize
+- [x] **Phase 1**: Operator group segmentation by save/restore depth with full CTM tracking
+- [x] **Phase 2**: Group classification (image/text/vector/background/button) with bounds computation
+- [x] **Phase 3**: Canvas replay rasterization for vector groups (fill, stroke, bezier paths, clips)
+- [x] **Unified PSD assembly**: Text + vector + image + background layers at correct z-order
+- [x] **Vector shape extraction**: Filled rectangles, rotated polygons, bezier decorations, button backgrounds now separate layers
+
+### Next Session (v3.1 plan)
+- [ ] Test with Canva, Figma, InDesign, Word PDFs to verify vector extraction works across creators
+- [ ] Tune depth-2 segmentation heuristic for non-Canva PDFs (may need adaptive depth detection)
+- [ ] Improve `curveTo2`/`curveTo3` handling (currently approximated with quadratic/degenerate cubic)
+- [ ] Consider enabling "Clean up background" toggle by default now that vector layers are extracted
+- [ ] Improve font name resolution — enhance `resolveFont()` for more edge cases
 
 ### Backlog
 - [ ] Smart layer grouping (group related text + image layers)
-- [ ] Vector shape extraction (if feasible — likely not due to PDF drawing model)
 - [ ] Gradient detection for background regions
 - [ ] Multiple font styles within a single TypeLayer (StyleRun arrays)
+- [ ] Adaptive segmentation depth for non-Canva PDF generators
