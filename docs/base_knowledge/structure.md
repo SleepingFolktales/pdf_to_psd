@@ -84,10 +84,10 @@ and each draw op (fill/stroke/image/text) snapshots `ctmAtDraw`.
 
 ---
 
-## v4 Architecture: Four-Phase Pipeline (updated v4.3)
+## v4 Architecture: Four-Phase Pipeline (updated v4.4)
 
 The v4 pipeline fixes three critical bugs from v3 and adds native PSD Shape Layer support.
-v4.3 expands shape layer eligibility to clipped groups, uses clip paths as vector masks, fixes text color tracking (per-showText), and makes text merge always-on.
+v4.4 fixes vectorMask coordinate order, inverts path source selection (draw-op first, clip fallback), adds font-homogeneity/color/section-boundary guards to text merge, and clamps text canvas sizes.
 
 ### Transform chain: `pixelCoord = viewportTransform × pageTransform × elementTransform × localCoord`
 
@@ -144,17 +144,19 @@ PDF File
            │
            ▼
 ┌──────────────────────────────────────────────────────┐
-│  PHASE 3A: SHAPE LAYER CREATION (v4.3 expanded)     │
+│  PHASE 3A: SHAPE LAYER CREATION (v4.4)               │
 │     shouldUseShapeLayer() → createShapeLayer()       │
 │                                                      │
-│  Eligibility (v4.3): any vector-only group with      │
-│    solid color — clips no longer disqualify.         │
-│  • Clip paths as vector masks: curved clip paths     │
-│    (rounded rects, circles) become the vectorMask    │
-│    instead of the draw op paths                      │
+│  Eligibility: any vector-only group with solid color │
+│    — clips do not disqualify.                        │
+│  • v4.4 Path source selection (INVERTED from v4.3):  │
+│    PRIMARY: draw-op fill/stroke paths (actual shape) │
+│    FALLBACK: curved clip paths ONLY when draw-ops    │
+│      have no curves (progress bars = clip is pill)   │
+│    NEVER: rectangular clips as vectorMask            │
 │  • pdfPathToPsdVectorMask: PDF paths → ag-psd knots  │
-│    - Apply ctmAtDraw or clipTransform for pixel coords│
-│    - [y,x] knot ordering per ag-psd convention       │
+│    - v4.4: [y,x] knot ordering (was [x,y] in v4.3) │
+│    - Apply ctmAtDraw or clipTransform for abs pixels │
 │  • vectorFill: { type:'color', color:{r,g,b} }      │
 │  • vectorStroke: searches ALL draw ops, CTM-scaled   │
 │  • Sidebar containers: stroke-only + clip → synth bg │
@@ -170,11 +172,21 @@ PDF File
            │
            ▼
 ┌──────────────────────────────────────────────────────┐
-│  TEXT COLORS + IMAGE LAYERS + TEXT MERGE              │
-│  • v4.3: per-showText color emission (not per-block) │
+│  TEXT COLORS + IMAGE LAYERS + TEXT MERGE (v4.4)       │
+│  • Per-showText color emission (not per-block)       │
 │  • Apply op-list colors to text items by order       │
 │  • Build image layers from extractedImgs + z-tag     │
-│  • v4.3: mergeBlocks always runs (not toggle-gated)  │
+│  • v4.4: Extract section boundaries from thin strokes│
+│  • mergeBlocks always runs with guards:              │
+│    - Pre-pass: same-line word coalescing             │
+│    - Paragraph merge with v4.4 guards:               │
+│      ④ fontName must match seed                      │
+│      ⑤ fontSize ratio ≤ 1.10                        │
+│      ⑥ color must match (RGB equality)              │
+│      ⑧ no merge across section boundary lines       │
+│    - Y-gap tightened: ≤ 1.8× fh (was 2.5×)         │
+│  • v4.4: tWidth computed from item positions         │
+│  • v4.4: canvas size = multi-line height, clamped    │
 │  • Build TypeLayers with canvas + text metadata      │
 │  • Tag all layers with _zIndex for sorting           │
 └──────────┬───────────────────────────────────────────┘
@@ -202,6 +214,18 @@ PDF File
            ▼
        PSD File
 ```
+
+### v4.4 vs v4.3 improvements
+
+| Problem | v4.3 (broken) | v4.4 (fixed) |
+|---------|---------------|---------------|
+| VectorMask coordinates swapped | Knot points written as `[x,y]` | Corrected to `[y,x]` per ag-psd convention |
+| Decorative shapes use clip mask | Curved clip paths always preferred → full-canvas bounds | Draw-op paths preferred; curved clips only as fallback for progress bars |
+| "Evans" merged with "Digital Marketing" | No font/size/color guards in paragraph merge | fontName match + fontSize ratio ≤ 1.10 + color equality required |
+| "About Me" merged with paragraph text | No section boundary awareness | Thin vector strokes extracted as boundaries, merges blocked across them |
+| Text canvas oversized for multi-line | Single-line height `fs*1.4` for all blocks | `fs * 1.4 * lineCount`, clamped to document dimensions |
+| Y-gap too permissive | Next-line gap ≤ 2.5× font height | Tightened to ≤ 1.8× font height |
+| tWidth not computed | Always fallback `fs * text.length * 0.6` | Measured from actual item positions in merged block |
 
 ### v4.3 vs v4.2 improvements
 
@@ -245,20 +269,21 @@ PSD File (width × height = canvas pixels at DPI)
 
 ---
 
-## Key Functions (v4.0)
+## Key Functions (v4.4)
 
 | Function | Phase | Purpose |
 |----------|-------|---------|
 | `segmentOperatorList` | 1 | Walk operator list, emit sub-groups with ctmAtDraw per draw op |
 | `flushSubGroup` | 1 | Emit depth-3 sub-element as separate OperatorGroup |
-| `classifyAllGroups` | 2 | Classify groups, compute bounds with per-op CTM |
+| `classifyAllGroups` | 2 | Classify groups, compute bounds, clip-companion merge, spatial overlap merge |
 | `computeGroupBounds` | 2 | Bounding box from all draw ops using their ctmAtDraw |
-| `shouldUseShapeLayer` | 3A | Gate: vector-only ops with solid colors (v4.3: clips allowed) |
-| `pdfPathToPsdVectorMask` | 3A | PDF paths → ag-psd vectorMask knots (normalized [y,x]) |
-| `createShapeLayer` | 3A | Build full ag-psd layer with vectorMask/Fill/Stroke + preview |
+| `shouldUseShapeLayer` | 3A | Gate: vector-only ops with solid colors, clips allowed |
+| `pdfPathToPsdVectorMask` | 3A | PDF paths → ag-psd vectorMask knots (v4.4: absolute pixels, [y,x] order) |
+| `createShapeLayer` | 3A | v4.4: draw-op paths primary, curved clip fallback; vectorMask/Fill/Stroke + preview |
 | `rasterizeForPreview` | 3B | Canvas replay with per-draw-op CTM for preview/fallback |
 | `rasterizeVectorGroup` | 3B | Wrapper returning positioned canvas for pixel layers |
-| `extractPageImages` | — | Image extraction + text color extraction from operator list |
+| `mergeBlocks` | text | v4.4: word coalescing + paragraph merge with font/size/color/boundary guards |
+| `extractPageImages` | — | Image extraction + per-showText color extraction from operator list |
 
 ---
 

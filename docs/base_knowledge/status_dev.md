@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v4.3 (Shape Layer Expansion, Rasterization Fix, Per-ShowText Color, Always-On Text Merge)
+## Current Version: v4.4 (VectorMask Coord Fix, Draw-Op Path Source, Font-Homogeneity Merge, Section Boundaries, Canvas Clamp)
 
 ---
 
@@ -181,6 +181,16 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 ---
 
 ## What We Did (Changelog)
+
+### v4.4 — VectorMask Coord Fix, Draw-Op Path Source, Font-Homogeneity Merge, Section Boundaries, Canvas Clamp
+- **VectorMask Coordinate Order Fix (Critical P0)**: Swapped knot point coordinates in `pdfPathToPsdVectorMask()` from `[x,y]` to `[y,x]` order. ag-psd expects `[control1_y, control1_x, anchor_y, anchor_x, control2_y, control2_x]` but v4.3 was writing `[x,y]`, causing shape layers to render at wrong positions/orientations in Photoshop. Applied to `straightKnot()` and all three `curveTo`/`curveTo2`/`curveTo3` handlers
+- **Draw-Op Path Source Selection (High P0)**: Inverted path source logic in `createShapeLayer()` — PRIMARY: use draw-op fill/stroke paths (the actual shape geometry). FALLBACK: use curved clip paths ONLY when draw-op paths have no curves (progress bars where the clip IS the visible pill shape). Previously v4.3 preferred clip paths first, which caused decorative shapes (gold wave/spiral/arch) to use the large content-area clip as their vectorMask, producing uniform full-canvas bounds instead of correct per-shape geometry
+- **Font Homogeneity Merge Guard (High P1)**: Added three new guards to the paragraph merge loop in `mergeBlocks()`: (1) `fontName` must match seed, (2) `fontSize` ratio must be ≤ 1.10 (same visual hierarchy level), (3) color must match (RGB equality). Prevents merging across font families, sizes, or colors. Fixes "Evans" (116pt Bold gold) merging with "Digital Marketing" (42pt Bold black), and "About Me" header merging with skill labels
+- **Section Boundary Merge Suppression (High P1)**: Extracts thin vector stroke lines (height ≤ 4px, width > 20px for horizontal; width ≤ 4px, height > 20px for vertical) from classified groups as section boundaries. `mergeBlocks()` now checks if a candidate merge would cross any boundary and rejects it. Prevents merging text across decorative divider lines
+- **Text Layer Canvas Size Clamp (Medium P1)**: Multi-line text layers now compute correct canvas height as `fontSize * 1.4 * lineCount` instead of single-line height. Both width and height are clamped to document dimensions to prevent oversized canvases. `mergeBlocks()` now computes and stores `tWidth` (actual measured text width from item positions) for accurate canvas sizing
+- **Y-Gap Tightened**: Reduced next-line vertical gap threshold from 2.5× to 1.8× font height, preventing merges across large vertical gaps between unrelated text blocks
+- **Version header**: Updated to v4.4
+- **Debug labels**: Assembly section labeled "v4.4 — vectorMask fix, draw-op paths, font-homogeneity merge, section boundaries"
 
 ### v4.3 — Shape Layer Expansion, Rasterization Fix, Per-ShowText Color, Always-On Text Merge
 - **Transparent Rasterization Fix (Critical P0)**: Expanded `shouldUseShapeLayer()` to allow groups with multiple clips — previously groups with >1 clip were forced to rasterization fallback which produced transparent checkerboards for deeply nested transforms. Now clip paths (especially curved/rounded-rect clips) are used as vector masks in `createShapeLayer()`, bypassing the broken rasterization path entirely

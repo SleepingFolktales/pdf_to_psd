@@ -1,11 +1,11 @@
-<!-- PDF → PSD Converter v4.3 -->
-<!-- Four-phase pipeline with v4.3: shape layer expansion, rasterization fix, per-showText color, always-on text merge -->
+<!-- PDF → PSD Converter v4.4 -->
+<!-- Four-phase pipeline with v4.4: vectorMask coord fix, draw-op path source, font-homogeneity merge, section boundaries, canvas clamp -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v4.3</title>
+<title>PDF → PSD Converter v4.4</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -643,8 +643,10 @@ function initApp(){
   // that was the root cause of the left-column-wipeout bug.
   //
   // Merge is conservative: same-column guard (width < 45% canvas, height < 30% canvas).
-  function mergeBlocks(items, canvasW, canvasH){
+  // sectionBoundaries parameter added
+  function mergeBlocks(items, canvasW, canvasH, sectionBoundaries){
     if(!items.length) return[];
+    sectionBoundaries=sectionBoundaries||[];
     // ── v4.2 Pre-pass: coalesce same-line, same-font, same-color word fragments ──
     // PDF.js emits justified text as per-word items. Merge into per-line items
     // before the spatial paragraph merge. Respects color breaks.
@@ -682,6 +684,17 @@ function initApp(){
       }
       coalesced.push(cur);
     }
+    // v4.4 Fix 4: helper to check if a merge crosses a section boundary
+    function crossesBoundary(topY,botY,leftX,rightX){
+      for(const bd of sectionBoundaries){
+        if(bd.orientation==='horizontal'){
+          if(topY<bd.position&&botY>bd.position) return true;
+        }else{
+          if(leftX<bd.position&&rightX>bd.position) return true;
+        }
+      }
+      return false;
+    }
     const maxW=canvasW*.45, maxH=canvasH*.30;
     const sorted=[...coalesced].sort((a,b)=>(a.y-b.y)||(a.x-b.x));
     const used=new Uint8Array(sorted.length);
@@ -703,20 +716,31 @@ function initApp(){
           // ① Same line: y-band within 65% font height, x adjacent (≤ 4× fh gap)
           //    Wider x-gap catches spaced words in the same sentence
           const sameLine=Math.abs(it.y-mnY)<fh*.65 && it.x>=mnX-fh*.5 && it.x<=mxX+fh*4.0;
-          // ② Next line: x-aligned to group left (within 120% fh), vertical gap ≤ 2.5×fh
+          // ② Next line: x-aligned to group left (within 120% fh), vertical gap ≤ 1.8×fh
           //    Relaxed x-align catches indented paragraphs; larger gap catches loose leading
           const gapY=it.y-mxY;
-          const nextLine=Math.abs(it.x-mnX)<fh*1.2 && gapY>=-(fh*.3) && gapY<=fh*2.5;
+          const nextLine=Math.abs(it.x-mnX)<fh*1.2 && gapY>=-(fh*.3) && gapY<=fh*1.8;
           if(!sameLine&&!nextLine) continue;
-          // ③ Never merge items with different rotation — keep vertical text separate
+          // ③ Never merge items with different rotation
           if(!!it.isRotated!==!!seed.isRotated) continue;
-          // Block-size guards (prevent cross-column merges)
+          // ④ v4.4 Fix 3: Font name must match
+          if(it.fontName!==seed.fontName) continue;
+          // ⑤ v4.4 Fix 3: Font size ratio must be ≤ 1.10 (same hierarchy level)
+          const sizeRatio=Math.max(it.fontSize,seed.fontSize)/Math.min(it.fontSize,seed.fontSize);
+          if(sizeRatio>1.10) continue;
+          // ⑥ v4.4 Fix 3: Color must match
+          if(it.color.r!==seed.color.r||it.color.g!==seed.color.g||it.color.b!==seed.color.b) continue;
+          // ⑦ Block-size guards (prevent cross-column merges)
           const nW=Math.max(mxX,it.x+it.width)-Math.min(mnX,it.x);
           const nH=Math.max(mxY,it.y+it.height)-Math.min(mnY,it.y);
           if(nW>maxW||nH>maxH) continue;
+          // ⑧ v4.4 Fix 4: Do not merge across section boundary lines
+          const newMnY=Math.min(mnY,it.y), newMxY=Math.max(mxY,it.y+it.height);
+          const newMnX=Math.min(mnX,it.x), newMxX=Math.max(mxX,it.x+it.width);
+          if(crossesBoundary(newMnY,newMxY,newMnX,newMxX)) continue;
           group.push(j); used[j]=1;
-          mnX=Math.min(mnX,it.x); mnY=Math.min(mnY,it.y);
-          mxX=Math.max(mxX,it.x+it.width); mxY=Math.max(mxY,it.y+it.height);
+          mnX=newMnX; mnY=newMnY;
+          mxX=newMxX; mxY=newMxY;
           changed=true;
         }
       }
@@ -725,12 +749,14 @@ function initApp(){
       gItems.sort((a,b)=>{ const dy=a.y-b.y; return Math.abs(dy)>fh*.4?dy:a.x-b.x; });
 
       let text='', prevY=null;
+      let tWidth=0;
       for(const it of gItems){
-        if(prevY!==null&&Math.abs(it.y-prevY)>fh*.4) text+='\n';
+        if(prevY!==null&&Math.abs(it.y-prevY)>fh*.4){ text+='\n'; tWidth=Math.max(tWidth,it.bx+it.width-gItems[0].bx); }
         text+=it.str; prevY=it.y;
       }
+      tWidth=Math.max(tWidth,gItems[gItems.length-1].bx+gItems[gItems.length-1].width-gItems[0].bx);
 
-      blocks.push({ text, bx:gItems[0].bx, by:gItems[0].by, fontName:gItems[0].fontName, fontSize:gItems[0].fontSize, color:gItems[0].color, isRotated:gItems[0].isRotated, cosA:gItems[0].cosA, sinA:gItems[0].sinA });
+      blocks.push({ text, bx:gItems[0].bx, by:gItems[0].by, tWidth, fontName:gItems[0].fontName, fontSize:gItems[0].fontSize, color:gItems[0].color, isRotated:gItems[0].isRotated, cosA:gItems[0].cosA, sinA:gItems[0].sinA });
     }
     return blocks;
   }
@@ -1446,7 +1472,8 @@ function initApp(){
     let ci=0;
     let currentX=0,currentY=0;
 
-    // ag-psd expects PIXEL coordinates — it normalizes to 0..1 internally before writing the PSD binary.
+    // v4.4: ag-psd expects absolute document PIXEL coordinates in [y, x] order.
+    // It normalizes to 0..1 internally before writing the PSD binary.
     // Do NOT divide by docWidth/docHeight here; doing so causes double-normalization → 1×1 shapes.
     function toPx(lx,ly){
       return{
@@ -1456,7 +1483,7 @@ function initApp(){
     }
     function straightKnot(lx,ly){
       const{px,py}=toPx(lx,ly);
-      return{linked:true,points:[px,py,px,py,px,py]};
+      return{linked:true,points:[py,px,py,px,py,px]};
     }
 
     for(const op of ops){
@@ -1483,14 +1510,14 @@ function initApp(){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
               const cp1p=toPx(cp1x,cp1y);
-              prevKnot.points[4]=cp1p.px;
-              prevKnot.points[5]=cp1p.py;
+              prevKnot.points[4]=cp1p.py;
+              prevKnot.points[5]=cp1p.px;
             }
             const cp2p=toPx(cp2x,cp2y);
             const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[cp2p.px,cp2p.py,endp.px,endp.py,endp.px,endp.py],
+              points:[cp2p.py,cp2p.px,endp.py,endp.px,endp.py,endp.px],
             });
           }
           currentX=endX;currentY=endY;
@@ -1503,14 +1530,14 @@ function initApp(){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
               const cpPrev=toPx(currentX,currentY);
-              prevKnot.points[4]=cpPrev.px;
-              prevKnot.points[5]=cpPrev.py;
+              prevKnot.points[4]=cpPrev.py;
+              prevKnot.points[5]=cpPrev.px;
             }
             const cp2p=toPx(cp2x,cp2y);
             const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[cp2p.px,cp2p.py,endp.px,endp.py,endp.px,endp.py],
+              points:[cp2p.py,cp2p.px,endp.py,endp.px,endp.py,endp.px],
             });
           }
           currentX=endX;currentY=endY;
@@ -1523,13 +1550,13 @@ function initApp(){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
               const cp1p=toPx(cp1x,cp1y);
-              prevKnot.points[4]=cp1p.px;
-              prevKnot.points[5]=cp1p.py;
+              prevKnot.points[4]=cp1p.py;
+              prevKnot.points[5]=cp1p.px;
             }
             const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[endp.px,endp.py,endp.px,endp.py,endp.px,endp.py],
+              points:[endp.py,endp.px,endp.py,endp.px,endp.py,endp.px],
             });
           }
           currentX=endX;currentY=endY;
@@ -1578,34 +1605,54 @@ function initApp(){
     const drawOp=group.drawOps[0];
     const ctm=drawOp.ctmAtDraw||[1,0,0,1,0,0];
 
-    // v4.3: Prefer clip paths as vector mask when the group has non-rect clips.
-    // For progress bars: the clip is a rounded-rect pill, the fill is a huge rect
-    // scaled down — using the clip path as the mask gives the correct shape.
+    // v4.4 Fix 1+C: Path source selection — INVERTED from v4.3.
+    // PRIMARY: use draw-op fill/stroke paths (the actual shape geometry).
+    // FALLBACK: use curved clip paths ONLY when draw-op paths have no curves
+    //   (progress bars where the clip IS the visible pill shape, draw-op is a plain rect).
+    // NEVER use rectangular clips as vectorMask (they are content-area clips, not shapes).
     const allPaths=[];
-    let usedClipAsMask=false;
-    if(group.clips.length>0){
-      for(const clip of group.clips){
-        // Prefer curved clip paths (rounded rects, circles) over plain rects
-        if(clip.ops){
-          const hasCurve=clip.ops.some(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3);
-          if(hasCurve){
+    let drawOpHasCurves=false;
+    let drawOpHasPaths=false;
+    for(const dop of group.drawOps){
+      if(dop.pathData&&dop.pathData.ops){
+        drawOpHasPaths=true;
+        if(dop.pathData.ops.some(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3)){
+          drawOpHasCurves=true;
+        }
+      }
+    }
+    if(drawOpHasCurves||drawOpHasPaths){
+      // Case 1: draw-op paths have curves (decorative shapes) — use draw-op paths
+      // Case 2: draw-op paths are plain rects but no curved clips — still use draw-op paths
+      let useCurvedClipFallback=false;
+      if(!drawOpHasCurves&&group.clips.length>0){
+        // Check if any clip has curves — if so, the clip IS the visible shape (progress bar)
+        for(const clip of group.clips){
+          if(clip.ops&&clip.ops.some(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3)){
+            useCurvedClipFallback=true;
+            break;
+          }
+        }
+      }
+      if(useCurvedClipFallback){
+        // Progress bar case: clip is rounded-rect pill, draw-op is plain rect fill
+        for(const clip of group.clips){
+          if(clip.ops&&clip.ops.some(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3)){
             const mask=pdfPathToPsdVectorMask(
               {ops:clip.ops,coords:clip.coords},
               clip.clipTransform||[1,0,0,1,0,0],
               docWidth, docHeight
             );
             allPaths.push(...mask.paths);
-            usedClipAsMask=true;
           }
         }
-      }
-    }
-    // Fallback: use draw op paths if no curved clips were found
-    if(!usedClipAsMask){
-      for(const dop of group.drawOps){
-        if(dop.pathData){
-          const mask=pdfPathToPsdVectorMask(dop.pathData, dop.ctmAtDraw||ctm, docWidth, docHeight);
-          allPaths.push(...mask.paths);
+      }else{
+        // Decorative shapes / simple rects: use draw-op paths directly
+        for(const dop of group.drawOps){
+          if(dop.pathData){
+            const mask=pdfPathToPsdVectorMask(dop.pathData, dop.ctmAtDraw||ctm, docWidth, docHeight);
+            allPaths.push(...mask.paths);
+          }
         }
       }
     }
@@ -2228,10 +2275,17 @@ function initApp(){
         for(const il of imgLayers) dbg(`  z=${il._zIndex} "${il.name}" top=${il.top} left=${il.left}`,'dbg-img');
 
         // ── 6. Merge into TypeLayer blocks ──
-        // v4.3: mergeBlocks always runs (word coalescing + paragraph grouping).
-        // The toggle no longer gates this — text merge is essential for correct output.
+        // v4.4: Extract section boundaries from thin vector stroke lines (dividers)
+        const sectionBoundaries=[];
+        for(const cg of classified){
+          if(cg.layerType===LayerType.VECTOR_STROKE&&cg.bounds){
+            const bw=cg.bounds.width, bh=cg.bounds.height;
+            if(bh<=4&&bw>20) sectionBoundaries.push({orientation:'horizontal',position:cg.bounds.top});
+            else if(bw<=4&&bh>20) sectionBoundaries.push({orientation:'vertical',position:cg.bounds.left});
+          }
+        }
         let blocks;
-        blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
+        blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height,sectionBoundaries);
         log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
         dbg(`── PAGE ${pageNum} TEXT LAYERS (merged) ──`,'dbg-section');
         for(let bi=0;bi<blocks.length;bi++){
@@ -2245,8 +2299,12 @@ function initApp(){
         const textLayers=blocks.map((b,idx)=>{
           const fs=b.fontSize;
           const tw=b.tWidth||fs*b.text.length*0.6;
-          const cW=Math.ceil(tw)+PAD*2;
-          const cH=Math.ceil(fs*1.4)+PAD*2;
+          // v4.4 Fix 5: multi-line height + canvas size clamp
+          const lineCount=(b.text.match(/\n/g)||[]).length+1;
+          const rawW=Math.ceil(tw)+PAD*2;
+          const rawH=Math.ceil(fs*1.4*lineCount)+PAD*2;
+          const cW=Math.min(rawW,bgCanvas.width);
+          const cH=Math.min(rawH,bgCanvas.height);
           const tc=document.createElement('canvas');
           tc.width=cW; tc.height=cH;
           const ctx=tc.getContext('2d');
@@ -2331,7 +2389,7 @@ function initApp(){
         };
 
         // ── Debug: PSD assembly ──
-        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.3 — shape layer expansion, per-showText color, always-on merge) ──`,'dbg-section');
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.4 — vectorMask fix, draw-op paths, font-homogeneity merge, section boundaries) ──`,'dbg-section');
         dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
         dbg(`  Layers: ${textLayers.length} text + ${vecLayers.length} vector (${shapeCount} shape + ${rasterCount} raster) + ${imgLayers.length} image + 1 bg = ${psd.children.length} total`);
         dbg(`  Layer stack (top→bottom in Photoshop):`);
