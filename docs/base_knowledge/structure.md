@@ -84,9 +84,10 @@ and each draw op (fill/stroke/image/text) snapshots `ctmAtDraw`.
 
 ---
 
-## v4 Architecture: Four-Phase Pipeline
+## v4 Architecture: Four-Phase Pipeline (updated v4.3)
 
 The v4 pipeline fixes three critical bugs from v3 and adds native PSD Shape Layer support.
+v4.3 expands shape layer eligibility to clipped groups, uses clip paths as vector masks, fixes text color tracking (per-showText), and makes text merge always-on.
 
 ### Transform chain: `pixelCoord = viewportTransform × pageTransform × elementTransform × localCoord`
 
@@ -143,20 +144,23 @@ PDF File
            │
            ▼
 ┌──────────────────────────────────────────────────────┐
-│  PHASE 3A: SHAPE LAYER CREATION (eligible vectors)   │
+│  PHASE 3A: SHAPE LAYER CREATION (v4.3 expanded)     │
 │     shouldUseShapeLayer() → createShapeLayer()       │
 │                                                      │
-│  Eligibility: ≤1 clip, solid color fills/strokes     │
+│  Eligibility (v4.3): any vector-only group with      │
+│    solid color — clips no longer disqualify.         │
+│  • Clip paths as vector masks: curved clip paths     │
+│    (rounded rects, circles) become the vectorMask    │
+│    instead of the draw op paths                      │
 │  • pdfPathToPsdVectorMask: PDF paths → ag-psd knots  │
-│    - Apply ctmAtDraw for pixel coords                │
-│    - Normalize to 0.0–1.0 relative to doc size       │
+│    - Apply ctmAtDraw or clipTransform for pixel coords│
 │    - [y,x] knot ordering per ag-psd convention       │
-│    - Handle curveTo → cp_in/cp_out on adjacent knots │
 │  • vectorFill: { type:'color', color:{r,g,b} }      │
-│  • vectorStroke: lineWidth scaled by CTM, cap/join   │
+│  • vectorStroke: searches ALL draw ops, CTM-scaled   │
+│  • Sidebar containers: stroke-only + clip → synth bg │
 │  • Preview canvas via rasterizeForPreview()          │
 │                                                      │
-│  PHASE 3B: RASTERIZATION FALLBACK (complex vectors)  │
+│  PHASE 3B: RASTERIZATION FALLBACK (remaining vectors)│
 │     rasterizeForPreview() + rasterizeVectorGroup()   │
 │                                                      │
 │  • Per-draw-op CTM applied to each replay step       │
@@ -167,9 +171,10 @@ PDF File
            ▼
 ┌──────────────────────────────────────────────────────┐
 │  TEXT COLORS + IMAGE LAYERS + TEXT MERGE              │
+│  • v4.3: per-showText color emission (not per-block) │
 │  • Apply op-list colors to text items by order       │
 │  • Build image layers from extractedImgs + z-tag     │
-│  • Merge text blocks (if enabled)                    │
+│  • v4.3: mergeBlocks always runs (not toggle-gated)  │
 │  • Build TypeLayers with canvas + text metadata      │
 │  • Tag all layers with _zIndex for sorting           │
 └──────────┬───────────────────────────────────────────┘
@@ -197,6 +202,17 @@ PDF File
            ▼
        PSD File
 ```
+
+### v4.3 vs v4.2 improvements
+
+| Problem | v4.2 (broken) | v4.3 (fixed) |
+|---------|---------------|---------------|
+| Progress bars transparent | Groups with >1 clip forced to rasterization which failed | Clip paths used as vector masks in shape layers, bypassing rasterization |
+| Unrelated groups merged | Clip-companion merge had no spatial overlap check | Added >50% overlap requirement |
+| Text color wrong | Per-block tracking with consumed/fallback caused cascading errors | Per-showText emission — simple, direct fill color at each showText |
+| Text merge optional | Toggle-gated, off by default | Always-on — word coalescing + paragraph grouping essential for output |
+| Sidebar containers hollow | Stroke-only groups got black fill | Synthesize fill from page background color |
+| Stroke descriptor missed | Only checked first draw op for strokes | Searches ALL draw ops in compound groups |
 
 ### v4 vs v3 improvements
 
@@ -237,7 +253,7 @@ PSD File (width × height = canvas pixels at DPI)
 | `flushSubGroup` | 1 | Emit depth-3 sub-element as separate OperatorGroup |
 | `classifyAllGroups` | 2 | Classify groups, compute bounds with per-op CTM |
 | `computeGroupBounds` | 2 | Bounding box from all draw ops using their ctmAtDraw |
-| `shouldUseShapeLayer` | 3A | Gate: ≤1 clip, solid colors → shape layer eligible |
+| `shouldUseShapeLayer` | 3A | Gate: vector-only ops with solid colors (v4.3: clips allowed) |
 | `pdfPathToPsdVectorMask` | 3A | PDF paths → ag-psd vectorMask knots (normalized [y,x]) |
 | `createShapeLayer` | 3A | Build full ag-psd layer with vectorMask/Fill/Stroke + preview |
 | `rasterizeForPreview` | 3B | Canvas replay with per-draw-op CTM for preview/fallback |
@@ -256,7 +272,7 @@ PSD File (width × height = canvas pixels at DPI)
 | Image dedup | Near-identical bounds (< 5 px) | Skip duplicate extraction |
 | Full-page image | Image covers > 90 % of canvas | Skip (it's a background fill) |
 | Tiny image | Image < 30 px on either side | Skip (bullet, icon, pattern tile) |
-| Shape layer fallback | >1 clip or no solid color | Fall back to rasterized pixel layer |
+| Shape layer fallback | Mixed content (text/image) or no solid color | Fall back to rasterized pixel layer |
 
 ---
 

@@ -1,11 +1,11 @@
-<!-- PDF → PSD Converter v4.2 -->
-<!-- Four-phase pipeline with v4.2 refinements: text merge, color scoping, clip-companion compositing, widget merge -->
+<!-- PDF → PSD Converter v4.3 -->
+<!-- Four-phase pipeline with v4.3: shape layer expansion, rasterization fix, per-showText color, always-on text merge -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v4.2</title>
+<title>PDF → PSD Converter v4.3</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -1336,7 +1336,16 @@ function initApp(){
         const curTypes=new Set(cur.group.drawOps.map(d=>d.type));
         const nxtTypes=new Set(nxt.group.drawOps.map(d=>d.type));
         const isFillStroke=(curTypes.has('fill')&&nxtTypes.has('stroke'))||(curTypes.has('stroke')&&nxtTypes.has('fill'));
-        if(isFillStroke&&curClips.length>0&&clipsMatch(curClips,nxtClips)){
+        // v4.3: also require spatial overlap (>50% of smaller) to prevent merging unrelated adjacent groups
+        let pairOverlap=0;
+        if(cur.bounds&&nxt.bounds){
+          const ox=Math.max(0,Math.min(cur.bounds.left+cur.bounds.width,nxt.bounds.left+nxt.bounds.width)-Math.max(cur.bounds.left,nxt.bounds.left));
+          const oy=Math.max(0,Math.min(cur.bounds.top+cur.bounds.height,nxt.bounds.top+nxt.bounds.height)-Math.max(cur.bounds.top,nxt.bounds.top));
+          const inter=ox*oy;
+          const smaller=Math.min(cur.bounds.width*cur.bounds.height,nxt.bounds.width*nxt.bounds.height);
+          pairOverlap=smaller>0?inter/smaller:0;
+        }
+        if(isFillStroke&&curClips.length>0&&clipsMatch(curClips,nxtClips)&&pairOverlap>0.5){
           // Merge: combine drawOps, use the stroke group's z-index, union bounds
           const mergedGroup={
             opStart:Math.min(cur.group.opStart,nxt.group.opStart),
@@ -1548,32 +1557,56 @@ function initApp(){
 
   function shouldUseShapeLayer(classifiedGroup){
     const{group}=classifiedGroup;
-    // Complex clips → rasterize fallback
-    if(group.clips.length>1) return false;
-    // Must have at least one draw op with valid color
+    // v4.3: Allow groups with clips — clip paths become part of the vector mask.
+    // Only reject groups with mixed content (text/image + vector) that can't be shape layers.
     let hasValidColor=false;
+    let hasNonVectorOp=false;
     for(const drawOp of group.drawOps){
       if(drawOp.type==='fill'||drawOp.type==='fillStroke'){
-        if(drawOp.fillColor){ hasValidColor=true; break; }
-      }
-      if(drawOp.type==='stroke'){
-        if(drawOp.strokeColor){ hasValidColor=true; break; }
+        if(drawOp.fillColor) hasValidColor=true;
+      }else if(drawOp.type==='stroke'){
+        if(drawOp.strokeColor) hasValidColor=true;
+      }else if(drawOp.type==='text'||drawOp.type==='image'){
+        hasNonVectorOp=true;
       }
     }
-    return hasValidColor;
+    return hasValidColor&&!hasNonVectorOp;
   }
 
-  function createShapeLayer(classifiedGroup, docWidth, docHeight){
+  function createShapeLayer(classifiedGroup, docWidth, docHeight, bgColor){
     const{group,bounds,name}=classifiedGroup;
     const drawOp=group.drawOps[0];
     const ctm=drawOp.ctmAtDraw||[1,0,0,1,0,0];
 
-    // Collect paths from all draw ops (compound shapes)
+    // v4.3: Prefer clip paths as vector mask when the group has non-rect clips.
+    // For progress bars: the clip is a rounded-rect pill, the fill is a huge rect
+    // scaled down — using the clip path as the mask gives the correct shape.
     const allPaths=[];
-    for(const dop of group.drawOps){
-      if(dop.pathData){
-        const mask=pdfPathToPsdVectorMask(dop.pathData, dop.ctmAtDraw||ctm, docWidth, docHeight);
-        allPaths.push(...mask.paths);
+    let usedClipAsMask=false;
+    if(group.clips.length>0){
+      for(const clip of group.clips){
+        // Prefer curved clip paths (rounded rects, circles) over plain rects
+        if(clip.ops){
+          const hasCurve=clip.ops.some(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3);
+          if(hasCurve){
+            const mask=pdfPathToPsdVectorMask(
+              {ops:clip.ops,coords:clip.coords},
+              clip.clipTransform||[1,0,0,1,0,0],
+              docWidth, docHeight
+            );
+            allPaths.push(...mask.paths);
+            usedClipAsMask=true;
+          }
+        }
+      }
+    }
+    // Fallback: use draw op paths if no curved clips were found
+    if(!usedClipAsMask){
+      for(const dop of group.drawOps){
+        if(dop.pathData){
+          const mask=pdfPathToPsdVectorMask(dop.pathData, dop.ctmAtDraw||ctm, docWidth, docHeight);
+          allPaths.push(...mask.paths);
+        }
       }
     }
     const vectorMask={paths:allPaths};
@@ -1583,28 +1616,37 @@ function initApp(){
     for(const dop of group.drawOps){
       if((dop.type==='fill'||dop.type==='fillStroke')&&dop.fillColor){fillColor=dop.fillColor;break;}
     }
+    // v4.3: For stroke-only groups (sidebar containers), synthesize fill from bg color
+    if(!fillColor&&bgColor){
+      const hasOnlyStrokes=group.drawOps.every(d=>d.type==='stroke');
+      if(hasOnlyStrokes&&group.clips.length>0) fillColor=bgColor;
+    }
     if(!fillColor) fillColor=group.fillColor||group.strokeColor||{r:0,g:0,b:0};
     const vectorFill={type:'color',color:{r:fillColor.r,g:fillColor.g,b:fillColor.b}};
 
-    // Build stroke descriptor — only if stroke color exists (ag-psd requires content.type)
+    // Build stroke descriptor — check ALL draw ops for strokes
     let vectorStroke=null;
-    if(drawOp.type==='stroke'||drawOp.type==='fillStroke'){
-      const c=drawOp.strokeColor;
-      if(c){
-        const lw=drawOp.lineWidth||1;
-        const scaleX=Math.sqrt(ctm[0]**2+ctm[1]**2);
-        const pixelLW=lw*scaleX;
-        const gs=drawOp.gStateAtDraw||group.graphicsState||{};
-        vectorStroke={
-          strokeEnabled:true,
-          fillEnabled:drawOp.type==='fillStroke',
-          lineWidth:{value:pixelLW,units:'Points'},
-          lineCapType:['butt','round','square'][gs.lineCap||0]||'butt',
-          lineJoinType:['miter','round','bevel'][gs.lineJoin||0]||'miter',
-          miterLimit:gs.miterLimit||10,
-          lineAlignment:'center',
-          content:{type:'color',color:{r:c.r,g:c.g,b:c.b}},
-        };
+    for(const dop of group.drawOps){
+      if(dop.type==='stroke'||dop.type==='fillStroke'){
+        const c=dop.strokeColor;
+        if(c){
+          const dopCtm=dop.ctmAtDraw||ctm;
+          const lw=dop.lineWidth||1;
+          const scaleX=Math.sqrt(dopCtm[0]**2+dopCtm[1]**2);
+          const pixelLW=lw*scaleX;
+          const gs2=dop.gStateAtDraw||group.graphicsState||{};
+          vectorStroke={
+            strokeEnabled:true,
+            fillEnabled:true,
+            lineWidth:{value:pixelLW,units:'Points'},
+            lineCapType:['butt','round','square'][gs2.lineCap||0]||'butt',
+            lineJoinType:['miter','round','bevel'][gs2.lineJoin||0]||'miter',
+            miterLimit:gs2.miterLimit||10,
+            lineAlignment:'center',
+            content:{type:'color',color:{r:c.r,g:c.g,b:c.b}},
+          };
+          break;
+        }
       }
     }
 
@@ -1812,68 +1854,38 @@ function initApp(){
 
     let skippedTiny=0, skippedFullPage=0;
 
-    // ── Text color tracking (parallel pass alongside image extraction) ──
-    // PDF.js setFillRGBColor args are 0-255 integers (not 0-1 floats).
-    // We collect one color per non-empty text block (beginText…endText with ≥1 showText).
-    // These are matched to getTextContent items by ORDER — same rendering sequence.
-    // NOTE (v2.6): operator-extracted BOUNDS were removed — setTextMatrix coords are in LOCAL
-    // space (missing CTM chain), so they were systematically wrong. getTextContent positions
-    // are already correct in page-space. Only color extraction is kept here.
+    // ── v4.3 Text color tracking — per-showText emission ──
+    // Emit one color per showText/showSpacedText call instead of per beginText/endText block.
+    // This aligns with getTextContent which emits ~1 item per showText call.
+    // Simply track the current fill color and emit it at each showText.
     const textColors=[];
     let tcFillR=0, tcFillG=0, tcFillB=0;
-    let tcColorConsumedByVec=false; // v4.2: true if a fill/stroke used the current color
-    let tcLastTextR=0, tcLastTextG=0, tcLastTextB=0; // v4.2: last confirmed text color
-    let tcInBlock=false, tcBlockHas=false;
-    let tcBlockR=0, tcBlockG=0, tcBlockB=0;
+    let tcInBlock=false;
 
     for(let i=0;i<ops.fnArray.length;i++){
       const fn=ops.fnArray[i], args=ops.argsArray[i];
       // ── Color state tracking ──────────────────────────────────────────────
       if(fn===pdfjsLib.OPS.setFillRGBColor){
-        // PDF.js 3.x passes RGB as 0-255 integers in the operator list.
-        // Guard: if somehow float 0-1, scale up. args[0]>1 means already integer scale.
         const s=args[0]>1?1:255;
         tcFillR=Math.min(255,Math.round(args[0]*s));
         tcFillG=Math.min(255,Math.round(args[1]*s));
         tcFillB=Math.min(255,Math.round(args[2]*s));
-        tcColorConsumedByVec=false;
       }else if(fn===pdfjsLib.OPS.setFillGray){
-        // gray: same 0-255 integer scale as RGB in PDF.js 3.x
         const s=args[0]>1?1:255;
         const gv=Math.min(255,Math.round(args[0]*s));
         tcFillR=gv; tcFillG=gv; tcFillB=gv;
-        tcColorConsumedByVec=false;
       }else if(fn===pdfjsLib.OPS.setFillCMYKColor){
-        // Approximate CMYK→RGB for color extraction
-        const c=args[0],m=args[1],y=args[2],k=args[3];
-        tcFillR=Math.round(255*(1-c)*(1-k));
-        tcFillG=Math.round(255*(1-m)*(1-k));
-        tcFillB=Math.round(255*(1-y)*(1-k));
-        tcColorConsumedByVec=false;
-      }else if(fn===pdfjsLib.OPS.fill||fn===pdfjsLib.OPS.eoFill||fn===pdfjsLib.OPS.fillStroke||fn===pdfjsLib.OPS.eoFillStroke||fn===pdfjsLib.OPS.stroke){
-        // v4.2: vector draw consumed the current fill color
-        if(!tcInBlock) tcColorConsumedByVec=true;
+        const c2=args[0],m2=args[1],y2=args[2],k2=args[3];
+        tcFillR=Math.round(255*(1-c2)*(1-k2));
+        tcFillG=Math.round(255*(1-m2)*(1-k2));
+        tcFillB=Math.round(255*(1-y2)*(1-k2));
       }else if(fn===pdfjsLib.OPS.beginText){
-        tcInBlock=true; tcBlockHas=false;
-        // v4.2: If current color was consumed by a vector draw, fall back to last text color
-        if(tcColorConsumedByVec){
-          tcBlockR=tcLastTextR; tcBlockG=tcLastTextG; tcBlockB=tcLastTextB;
-        }else{
-          tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
-        }
+        tcInBlock=true;
       }else if(fn===pdfjsLib.OPS.showText||fn===pdfjsLib.OPS.showSpacedText){
         if(tcInBlock){
-          tcBlockHas=true;
-          // v4.2: Use most recent fill color only if not consumed by vector draw
-          if(!tcColorConsumedByVec){
-            tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
-          }
-          tcLastTextR=tcBlockR; tcLastTextG=tcBlockG; tcLastTextB=tcBlockB;
+          textColors.push({r:tcFillR,g:tcFillG,b:tcFillB});
         }
       }else if(fn===pdfjsLib.OPS.endText){
-        if(tcBlockHas){
-          textColors.push({r:tcBlockR,g:tcBlockG,b:tcBlockB});
-        }
         tcInBlock=false;
       }
       // ── CTM + image extraction (existing logic) ───────────────────────────
@@ -2144,7 +2156,8 @@ function initApp(){
           // Phase 3A: Try shape layer for eligible groups
           if(shouldUseShapeLayer(cg)){
             try{
-              const sl=createShapeLayer(cg,bgCanvas.width,bgCanvas.height);
+              const bgColor=bgGroups.length>0&&bgGroups[0].color?bgGroups[0].color:null;
+              const sl=createShapeLayer(cg,bgCanvas.width,bgCanvas.height,bgColor);
               vecLayers.push({...sl,_zIndex:cg.zIndex,_type:'shape'});
               shapeCount++;
               continue;
@@ -2215,15 +2228,12 @@ function initApp(){
         for(const il of imgLayers) dbg(`  z=${il._zIndex} "${il.name}" top=${il.top} left=${il.left}`,'dbg-img');
 
         // ── 6. Merge into TypeLayer blocks ──
+        // v4.3: mergeBlocks always runs (word coalescing + paragraph grouping).
+        // The toggle no longer gates this — text merge is essential for correct output.
         let blocks;
-        if(doMerge){
-          blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
-          log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
-        }else{
-          blocks=rawItems.map(it=>({text:it.str,bx:it.bx,by:it.by,tWidth:it.width,fontName:it.fontName,fontSize:it.fontSize,color:it.color,isRotated:it.isRotated,cosA:it.cosA,sinA:it.sinA}));
-          log('Page '+pageNum+': '+blocks.length+' text layer(s) (unmerged)','ok');
-        }
-        dbg(`── PAGE ${pageNum} TEXT LAYERS (${doMerge?'merged':'unmerged'}) ──`,'dbg-section');
+        blocks=mergeBlocks(rawItems,bgCanvas.width,bgCanvas.height);
+        log('Page '+pageNum+': '+rawItems.length+' items → '+blocks.length+' text layer(s) (merged)','ok');
+        dbg(`── PAGE ${pageNum} TEXT LAYERS (merged) ──`,'dbg-section');
         for(let bi=0;bi<blocks.length;bi++){
           const b=blocks[bi];
           const preview=b.text.replace(/\n/g,'\\n').slice(0,60);
@@ -2321,7 +2331,7 @@ function initApp(){
         };
 
         // ── Debug: PSD assembly ──
-        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.2 — unified z-order, solid bg, text merge, color scoping) ──`,'dbg-section');
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.3 — shape layer expansion, per-showText color, always-on merge) ──`,'dbg-section');
         dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
         dbg(`  Layers: ${textLayers.length} text + ${vecLayers.length} vector (${shapeCount} shape + ${rasterCount} raster) + ${imgLayers.length} image + 1 bg = ${psd.children.length} total`);
         dbg(`  Layer stack (top→bottom in Photoshop):`);

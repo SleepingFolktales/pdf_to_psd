@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v4.2 (Resume PDF Refinements — Text Merge, Color Scoping, Clip-Companion Compositing, Widget Merge)
+## Current Version: v4.3 (Shape Layer Expansion, Rasterization Fix, Per-ShowText Color, Always-On Text Merge)
 
 ---
 
@@ -181,6 +181,17 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 ---
 
 ## What We Did (Changelog)
+
+### v4.3 — Shape Layer Expansion, Rasterization Fix, Per-ShowText Color, Always-On Text Merge
+- **Transparent Rasterization Fix (Critical P0)**: Expanded `shouldUseShapeLayer()` to allow groups with multiple clips — previously groups with >1 clip were forced to rasterization fallback which produced transparent checkerboards for deeply nested transforms. Now clip paths (especially curved/rounded-rect clips) are used as vector masks in `createShapeLayer()`, bypassing the broken rasterization path entirely
+- **Clip-Companion Merge Overlap Guard (High P0)**: Added spatial overlap check (>50% of smaller area) to the clip-companion fill+stroke merge post-pass. Previously, adjacent groups with matching clip paths were merged regardless of spatial overlap, causing unrelated groups (e.g., a progress bar and a divider line) to be incorrectly composited
+- **Shape Layer Clip-Path Masks (High P1)**: `createShapeLayer()` now prefers curved clip paths (rounded rects, circles) as the vector mask instead of the draw op paths. For progress bars where the fill is a huge rectangle scaled down through a tiny CTM but clipped to a pill shape, this produces the correct rounded-rect shape layer
+- **Sidebar Container Fill Synthesis (High P1)**: For stroke-only groups clipped to a shape (sidebar containers), `createShapeLayer()` now synthesizes a fill from the page background color. Previously these rendered as hollow black outlines
+- **Text Color Fix — Per-ShowText Emission (High P1)**: Replaced v4.2's per-block (`beginText`/`endText`) color tracking with per-`showText` emission. Each `showText`/`showSpacedText` call emits one color entry, aligning with `getTextContent()` which returns ~1 item per `showText`. Removed the `tcColorConsumedByVec` fallback logic which caused cascading color errors. Fixes invisible text like "Video and photo editing" picking up background color
+- **Always-On Text Merge (High P1)**: `mergeBlocks()` now always runs — the toggle no longer gates text merging. Word coalescing pre-pass + paragraph grouping are essential for correct output and should not be optional
+- **Stroke Descriptor Search Fix**: `createShapeLayer()` now searches ALL draw ops for stroke descriptors (not just the first draw op), correctly handling compound fill+stroke groups
+- **Version header**: Updated to v4.3
+- **Debug labels**: Assembly section labeled "v4.3 — shape layer expansion, per-showText color, always-on merge"
 
 ### v4.2 — Resume PDF Refinements (5 Systemic Failures from Complex Resume Test)
 - **Issue 4 — Text Fragmentation P0**: Added same-line word coalescing pre-pass in `mergeBlocks()`. Before the spatial paragraph merge, items are sorted by Y then X and consecutive items sharing the same line (within 2px Y), font, fontSize (within 0.5pt), color, and rotation are merged. Inserts spaces between words when gap exceeds 15% of average character width. Respects color breaks — different-colored runs on the same line become separate layers. This reduces per-word atomization of justified text from ~74 to ~35-40 text layers
