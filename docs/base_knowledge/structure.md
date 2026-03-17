@@ -84,10 +84,10 @@ and each draw op (fill/stroke/image/text) snapshots `ctmAtDraw`.
 
 ---
 
-## v4 Architecture: Four-Phase Pipeline (updated v4.4)
+## v4 Architecture: Four-Phase Pipeline (updated v4.5)
 
 The v4 pipeline fixes three critical bugs from v3 and adds native PSD Shape Layer support.
-v4.4 fixes vectorMask coordinate order, inverts path source selection (draw-op first, clip fallback), adds font-homogeneity/color/section-boundary guards to text merge, and clamps text canvas sizes.
+v4.5 reverts vectorMask knot ordering back to `[x,y]` (ag-psd API convention), replaces index-based text color mapping with position-correlated spatial matching, and hardens font name resolution.
 
 ### Transform chain: `pixelCoord = viewportTransform × pageTransform × elementTransform × localCoord`
 
@@ -155,7 +155,8 @@ PDF File
 │      have no curves (progress bars = clip is pill)   │
 │    NEVER: rectangular clips as vectorMask            │
 │  • pdfPathToPsdVectorMask: PDF paths → ag-psd knots  │
-│    - v4.4: [y,x] knot ordering (was [x,y] in v4.3) │
+│    - v4.5: [x,y] knot ordering (ag-psd API expects │
+│      [x,y]; library handles PSD binary [y,x])       │
 │    - Apply ctmAtDraw or clipTransform for abs pixels │
 │  • vectorFill: { type:'color', color:{r,g,b} }      │
 │  • vectorStroke: searches ALL draw ops, CTM-scaled   │
@@ -172,9 +173,11 @@ PDF File
            │
            ▼
 ┌──────────────────────────────────────────────────────┐
-│  TEXT COLORS + IMAGE LAYERS + TEXT MERGE (v4.4)       │
-│  • Per-showText color emission (not per-block)       │
-│  • Apply op-list colors to text items by order       │
+│  TEXT COLORS + IMAGE LAYERS + TEXT MERGE (v4.5)       │
+│  • v4.5: Position-correlated color mapping:          │
+│    - Track Tm/Td/TD/T* for showText canvas position  │
+│    - Match each rawItem to nearest showTextColor     │
+│      by spatial distance (threshold: 2× fontSize)   │
 │  • Build image layers from extractedImgs + z-tag     │
 │  • v4.4: Extract section boundaries from thin strokes│
 │  • mergeBlocks always runs with guards:              │
@@ -220,6 +223,17 @@ PDF File
 | Problem | v4.3 (broken) | v4.4 (fixed) |
 |---------|---------------|---------------|
 | VectorMask coordinates swapped | Knot points written as `[x,y]` | Corrected to `[y,x]` per ag-psd convention |
+
+### v4.5 vs v4.4 improvements
+
+| Problem | v4.4 (broken) | v4.5 (fixed) |
+|---------|---------------|--------------|
+| VectorMask knot order | `[y,x]` — transposed in Photoshop | `[x,y]` — matches ag-psd API; library handles binary swap |
+| Shape positions transposed | top↔left swapped in all shape layers | Correct positions matching Phase 3 log |
+| Fill layer bounds explosion | Small rects expand to full-canvas bounds | Correct bounds from correct mask paths |
+| Text color mapping | Index-based — breaks on non-linear paint order | Position-correlated spatial match via text matrix tracking |
+| "Greta Mae" color | Black (rgb 0,0,0) | Gold (#a07f13) matched by canvas position |
+| Font name fallback | Only checks `fontObj.name` | Also checks `fontObj.loadedName` for complete coverage |
 | Decorative shapes use clip mask | Curved clip paths always preferred → full-canvas bounds | Draw-op paths preferred; curved clips only as fallback for progress bars |
 | "Evans" merged with "Digital Marketing" | No font/size/color guards in paragraph merge | fontName match + fontSize ratio ≤ 1.10 + color equality required |
 | "About Me" merged with paragraph text | No section boundary awareness | Thin vector strokes extracted as boundaries, merges blocked across them |

@@ -1,11 +1,11 @@
-<!-- PDF → PSD Converter v4.4 -->
-<!-- Four-phase pipeline with v4.4: vectorMask coord fix, draw-op path source, font-homogeneity merge, section boundaries, canvas clamp -->
+<!-- PDF → PSD Converter v4.5 -->
+<!-- Four-phase pipeline with v4.5: vectorMask [x,y] order fix, position-correlated text colors, font name hardening -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v4.4</title>
+<title>PDF → PSD Converter v4.5</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -524,6 +524,10 @@ function initApp(){
       const fontObj=page.commonObjs.get(styleFontName);
       if(fontObj && fontObj.name){
         const psName=normFont(fontObj.name);
+        return psName;
+      }
+      if(fontObj && fontObj.loadedName){
+        const psName=normFont(fontObj.loadedName);
         return psName;
       }
     }catch(e){}
@@ -1472,9 +1476,9 @@ function initApp(){
     let ci=0;
     let currentX=0,currentY=0;
 
-    // v4.4: ag-psd expects absolute document PIXEL coordinates in [y, x] order.
-    // It normalizes to 0..1 internally before writing the PSD binary.
-    // Do NOT divide by docWidth/docHeight here; doing so causes double-normalization → 1×1 shapes.
+    // v4.5: ag-psd API expects absolute pixel coordinates in [x, y] order.
+    // The library converts to PSD binary [y, x] format internally — do NOT pre-swap.
+    // Do NOT divide by docWidth/docHeight; doing so causes double-normalization → 1×1 shapes.
     function toPx(lx,ly){
       return{
         px:ctm[0]*lx+ctm[2]*ly+ctm[4],
@@ -1483,7 +1487,7 @@ function initApp(){
     }
     function straightKnot(lx,ly){
       const{px,py}=toPx(lx,ly);
-      return{linked:true,points:[py,px,py,px,py,px]};
+      return{linked:true,points:[px,py,px,py,px,py]};
     }
 
     for(const op of ops){
@@ -1510,14 +1514,14 @@ function initApp(){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
               const cp1p=toPx(cp1x,cp1y);
-              prevKnot.points[4]=cp1p.py;
-              prevKnot.points[5]=cp1p.px;
+              prevKnot.points[4]=cp1p.px;
+              prevKnot.points[5]=cp1p.py;
             }
             const cp2p=toPx(cp2x,cp2y);
             const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[cp2p.py,cp2p.px,endp.py,endp.px,endp.py,endp.px],
+              points:[cp2p.px,cp2p.py,endp.px,endp.py,endp.px,endp.py],
             });
           }
           currentX=endX;currentY=endY;
@@ -1530,14 +1534,14 @@ function initApp(){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
               const cpPrev=toPx(currentX,currentY);
-              prevKnot.points[4]=cpPrev.py;
-              prevKnot.points[5]=cpPrev.px;
+              prevKnot.points[4]=cpPrev.px;
+              prevKnot.points[5]=cpPrev.py;
             }
             const cp2p=toPx(cp2x,cp2y);
             const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[cp2p.py,cp2p.px,endp.py,endp.px,endp.py,endp.px],
+              points:[cp2p.px,cp2p.py,endp.px,endp.py,endp.px,endp.py],
             });
           }
           currentX=endX;currentY=endY;
@@ -1550,13 +1554,13 @@ function initApp(){
             const prevKnot=currentPath.knots[currentPath.knots.length-1];
             if(prevKnot){
               const cp1p=toPx(cp1x,cp1y);
-              prevKnot.points[4]=cp1p.py;
-              prevKnot.points[5]=cp1p.px;
+              prevKnot.points[4]=cp1p.px;
+              prevKnot.points[5]=cp1p.py;
             }
             const endp=toPx(endX,endY);
             currentPath.knots.push({
               linked:true,
-              points:[endp.py,endp.px,endp.py,endp.px,endp.py,endp.px],
+              points:[endp.px,endp.py,endp.px,endp.py,endp.px,endp.py],
             });
           }
           currentX=endX;currentY=endY;
@@ -1901,13 +1905,13 @@ function initApp(){
 
     let skippedTiny=0, skippedFullPage=0;
 
-    // ── v4.3 Text color tracking — per-showText emission ──
-    // Emit one color per showText/showSpacedText call instead of per beginText/endText block.
-    // This aligns with getTextContent which emits ~1 item per showText call.
-    // Simply track the current fill color and emit it at each showText.
-    const textColors=[];
+    // ── v4.5 Text color tracking — position-correlated ──
+    // Record (canvas position, fillColor) at each showText via text matrix tracking.
+    // Matched to text items from getTextContent by spatial proximity, not array index.
+    const showTextColors=[];
     let tcFillR=0, tcFillG=0, tcFillB=0;
     let tcInBlock=false;
+    let tcTextMatrix=[1,0,0,1,0,0], tcTextLineMatrix=[1,0,0,1,0,0], tcTextLeading=0;
 
     for(let i=0;i<ops.fnArray.length;i++){
       const fn=ops.fnArray[i], args=ops.argsArray[i];
@@ -1928,9 +1932,32 @@ function initApp(){
         tcFillB=Math.round(255*(1-y2)*(1-k2));
       }else if(fn===pdfjsLib.OPS.beginText){
         tcInBlock=true;
+        tcTextMatrix=[1,0,0,1,0,0]; tcTextLineMatrix=[1,0,0,1,0,0];
+      }else if(fn===pdfjsLib.OPS.setTextMatrix){
+        tcTextMatrix=args.slice(0,6); tcTextLineMatrix=args.slice(0,6);
+      }else if(fn===pdfjsLib.OPS.moveText){
+        const tx=args[0],ty=args[1];
+        tcTextLineMatrix=[tcTextLineMatrix[0],tcTextLineMatrix[1],tcTextLineMatrix[2],tcTextLineMatrix[3],
+          tcTextLineMatrix[0]*tx+tcTextLineMatrix[2]*ty+tcTextLineMatrix[4],
+          tcTextLineMatrix[1]*tx+tcTextLineMatrix[3]*ty+tcTextLineMatrix[5]];
+        tcTextMatrix=[...tcTextLineMatrix];
+      }else if(fn===pdfjsLib.OPS.setLeadingMoveText){
+        const tx=args[0],ty=args[1]; tcTextLeading=-ty;
+        tcTextLineMatrix=[tcTextLineMatrix[0],tcTextLineMatrix[1],tcTextLineMatrix[2],tcTextLineMatrix[3],
+          tcTextLineMatrix[0]*tx+tcTextLineMatrix[2]*ty+tcTextLineMatrix[4],
+          tcTextLineMatrix[1]*tx+tcTextLineMatrix[3]*ty+tcTextLineMatrix[5]];
+        tcTextMatrix=[...tcTextLineMatrix];
+      }else if(fn===pdfjsLib.OPS.nextLine){
+        tcTextLineMatrix=[tcTextLineMatrix[0],tcTextLineMatrix[1],tcTextLineMatrix[2],tcTextLineMatrix[3],
+          tcTextLineMatrix[4]-tcTextLineMatrix[2]*tcTextLeading,
+          tcTextLineMatrix[5]-tcTextLineMatrix[3]*tcTextLeading];
+        tcTextMatrix=[...tcTextLineMatrix];
       }else if(fn===pdfjsLib.OPS.showText||fn===pdfjsLib.OPS.showSpacedText){
         if(tcInBlock){
-          textColors.push({r:tcFillR,g:tcFillG,b:tcFillB});
+          const tmx=tcTextMatrix[4],tmy=tcTextMatrix[5];
+          const devX=ctm[0]*tmx+ctm[2]*tmy+ctm[4], devY=ctm[1]*tmx+ctm[3]*tmy+ctm[5];
+          const canvasX=vpT[0]*devX+vpT[2]*devY+vpT[4], canvasY=vpT[1]*devX+vpT[3]*devY+vpT[5];
+          showTextColors.push({x:canvasX,y:canvasY,r:tcFillR,g:tcFillG,b:tcFillB});
         }
       }else if(fn===pdfjsLib.OPS.endText){
         tcInBlock=false;
@@ -1992,12 +2019,12 @@ function initApp(){
     dbg(`  Found: ${results.length} image(s)`,(results.length?'dbg-ok':'dbg-warn'));
     dbg(`  Skipped tiny (<30px): ${skippedTiny}`,'dbg-dim');
     dbg(`  Skipped full-page (>90%): ${skippedFullPage}`,'dbg-dim');
-    dbg(`  Text color blocks extracted from op list: ${textColors.length}`,(textColors.length?'dbg-ok':'dbg-warn'));
-    for(let ci=0;ci<textColors.length;ci++){
-      const c=textColors[ci];
-      dbg(`    Block ${ci+1}: rgb(${c.r},${c.g},${c.b})`,'dbg-dim');
+    dbg(`  Text color blocks extracted from op list: ${showTextColors.length}`,(showTextColors.length?'dbg-ok':'dbg-warn'));
+    for(let ci=0;ci<Math.min(showTextColors.length,20);ci++){
+      const c=showTextColors[ci];
+      dbg(`    Entry ${ci+1}: rgb(${c.r},${c.g},${c.b}) @ (${Math.round(c.x)},${Math.round(c.y)})`,'dbg-dim');
     }
-    return {images:results, textColors};
+    return {images:results, showTextColors};
   }
 
   // ── Main conversion ────────────────────────────────────────────────────────
@@ -2160,7 +2187,7 @@ function initApp(){
 
         // ── 3. V4 PIPELINE: segment → classify → shape/rasterize → unified z-order assembly ──
         setProgress(((pi+.45)/pages.length)*90,'Page '+pageNum+' — extracting images & colors…');
-        const {images:extractedImgs, textColors:opListColors}=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height,pageNum);
+        const {images:extractedImgs, showTextColors:opListColors}=await extractPageImages(page,vp,bgCanvas.width,bgCanvas.height,pageNum);
         const opList=await page.getOperatorList();
 
         // ── Phase 1: Segment operator list (v4 — fixed transforms + sub-group splitting) ──
@@ -2235,15 +2262,22 @@ function initApp(){
           dbg(`  z=${vl._zIndex} [${vl._type}] "${vl.name}" top=${vl.top} left=${vl.left} canvas=${cw}×${ch}`,'dbg-img');
         }
 
-        // ── 4. Apply text colors from operator list ──
-        for(let ti=0;ti<rawItems.length;ti++){
-          if(ti<opListColors.length) rawItems[ti].color=opListColors[ti];
+        // ── 4. Apply text colors from operator list (v4.5: position-correlated) ──
+        for(const it of rawItems){
+          let bestDist=Infinity,bestColor=null;
+          for(const stc of opListColors){
+            const dx=it.bx-stc.x,dy=it.by-stc.y;
+            const d=dx*dx+dy*dy;
+            if(d<bestDist){bestDist=d;bestColor=stc;}
+          }
+          const threshold=it.fontSize*it.fontSize*4;
+          if(bestColor&&bestDist<threshold) it.color={r:bestColor.r,g:bestColor.g,b:bestColor.b};
         }
         dbg(`── PAGE ${pageNum} OPERATOR-LIST COLORS ──`,'dbg-section');
-        dbg(`  Op-list blocks: ${opListColors.length}, text items: ${rawItems.length}`);
+        dbg(`  Op-list entries: ${opListColors.length}, text items: ${rawItems.length}`);
         for(let ti=0;ti<Math.min(rawItems.length,20);ti++){
-          const it=rawItems[ti]; const matched=ti<opListColors.length;
-          dbg(`  T${ti+1}: "${it.str.slice(0,30)}" → rgb(${it.color.r},${it.color.g},${it.color.b}) ${matched?'(op-list)':'(default black)'}`,(matched?'dbg-ok':'dbg-warn'));
+          const it=rawItems[ti];
+          dbg(`  T${ti+1}: "${it.str.slice(0,30)}" → rgb(${it.color.r},${it.color.g},${it.color.b})`,(it.color.r||it.color.g||it.color.b?'dbg-ok':'dbg-warn'));
         }
         if(doColors){
           for(const it of rawItems) it.color=sampleColor(bgCtx,it.x,it.y,it.width,it.height);
@@ -2389,7 +2423,7 @@ function initApp(){
         };
 
         // ── Debug: PSD assembly ──
-        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.4 — vectorMask fix, draw-op paths, font-homogeneity merge, section boundaries) ──`,'dbg-section');
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.5 — [x,y] vectorMask, position-correlated colors, font hardening) ──`,'dbg-section');
         dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
         dbg(`  Layers: ${textLayers.length} text + ${vecLayers.length} vector (${shapeCount} shape + ${rasterCount} raster) + ${imgLayers.length} image + 1 bg = ${psd.children.length} total`);
         dbg(`  Layer stack (top→bottom in Photoshop):`);

@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v4.4 (VectorMask Coord Fix, Draw-Op Path Source, Font-Homogeneity Merge, Section Boundaries, Canvas Clamp)
+## Current Version: v4.5 (VectorMask [x,y] Order Fix, Position-Correlated Text Colors, Font Name Hardening)
 
 ---
 
@@ -181,6 +181,13 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 ---
 
 ## What We Did (Changelog)
+
+### v4.5 — VectorMask [x,y] Order Fix, Position-Correlated Text Colors, Font Name Hardening
+- **VectorMask Coordinate Order Revert (Critical P0)**: Reverted knot point ordering in `pdfPathToPsdVectorMask()` from `[y,x]` back to `[x,y]`. V4.4 incorrectly swapped to `[y,x]` based on a misread of ag-psd's API — the library expects `[x,y]` and handles the PSD binary `[y,x]` encoding internally. Applied to `straightKnot()` and all `curveTo`/`curveTo2`/`curveTo3` handlers. Fixes: all shape layers transposed (top↔left swapped), small rects expanding to full-canvas bounds, decorative shapes mispositioned
+- **Position-Correlated Text Color Mapping (High P1)**: Replaced index-based color array mapping with spatial proximity matching. `extractPageImages()` now tracks the text matrix (`setTextMatrix`, `moveText`, `setLeadingMoveText`, `nextLine`) alongside the graphics CTM, computes each `showText` call's canvas position, and stores `{x, y, r, g, b}` in `showTextColors[]`. In `startConversion()`, each raw text item finds its best-match color entry by minimum squared distance (within 2× fontSize threshold). Fixes: heading "Greta Mae" was black instead of gold because paint-order index ≠ spatial order
+- **Font Name Fallback Hardening (Minor P2)**: `resolveFont()` now checks `fontObj.loadedName` as a secondary fallback when `fontObj.name` is absent. Improves PostScript name extraction for fonts where PDF.js populates `loadedName` but not `name`
+- **Version header**: Updated to v4.5
+- **Debug labels**: Assembly section labeled "v4.5 — [x,y] vectorMask, position-correlated colors, font hardening"
 
 ### v4.4 — VectorMask Coord Fix, Draw-Op Path Source, Font-Homogeneity Merge, Section Boundaries, Canvas Clamp
 - **VectorMask Coordinate Order Fix (Critical P0)**: Swapped knot point coordinates in `pdfPathToPsdVectorMask()` from `[x,y]` to `[y,x]` order. ag-psd expects `[control1_y, control1_x, anchor_y, anchor_x, control2_y, control2_x]` but v4.3 was writing `[x,y]`, causing shape layers to render at wrong positions/orientations in Photoshop. Applied to `straightKnot()` and all three `curveTo`/`curveTo2`/`curveTo3` handlers
