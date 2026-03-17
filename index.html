@@ -1,11 +1,11 @@
-<!-- PDF → PSD Converter v4.1 -->
-<!-- Four-phase pipeline with v4.1 refinements: z-order fix, solid background, vectorMask normalization, per-text z-index -->
+<!-- PDF → PSD Converter v4.2 -->
+<!-- Four-phase pipeline with v4.2 refinements: text merge, color scoping, clip-companion compositing, widget merge -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v4.1 - Normalization and Position Fix</title>
+<title>PDF → PSD Converter v4.2</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -645,8 +645,45 @@ function initApp(){
   // Merge is conservative: same-column guard (width < 45% canvas, height < 30% canvas).
   function mergeBlocks(items, canvasW, canvasH){
     if(!items.length) return[];
+    // ── v4.2 Pre-pass: coalesce same-line, same-font, same-color word fragments ──
+    // PDF.js emits justified text as per-word items. Merge into per-line items
+    // before the spatial paragraph merge. Respects color breaks.
+    const preSorted=[...items].sort((a,b)=>{
+      const dy=a.by-b.by; if(Math.abs(dy)>2) return dy; return a.bx-b.bx;
+    });
+    const coalesced=[];
+    let mi=0;
+    while(mi<preSorted.length){
+      const cur=Object.assign({},preSorted[mi]);
+      cur.str=cur.str||'';
+      mi++;
+      while(mi<preSorted.length){
+        const nxt=preSorted[mi];
+        // Same line: Y within 2px
+        if(Math.abs(nxt.by-cur.by)>2) break;
+        // Same font name
+        if(nxt.fontName!==cur.fontName) break;
+        // Same font size (within 0.5pt)
+        if(Math.abs(nxt.fontSize-cur.fontSize)>0.5) break;
+        // Same color (color-break splits layer)
+        if(nxt.color.r!==cur.color.r||nxt.color.g!==cur.color.g||nxt.color.b!==cur.color.b) break;
+        // Same rotation state
+        if(!!nxt.isRotated!==!!cur.isRotated) break;
+        // Gap check: nxt must be to the right, gap < 3x avg char width
+        const avgCharW=cur.width/(cur.str.length||1);
+        const gap=nxt.bx-(cur.bx+cur.width);
+        if(gap<-avgCharW*0.5||gap>avgCharW*3) break;
+        // Merge: append with space if gap warrants it
+        const needsSpace=gap>avgCharW*0.15&&!cur.str.endsWith(' ')&&!nxt.str.startsWith(' ');
+        cur.str=cur.str+(needsSpace?' ':'')+nxt.str;
+        cur.width=Math.max(cur.width,(nxt.bx-cur.bx)+nxt.width);
+        cur.height=Math.max(cur.height,nxt.height);
+        mi++;
+      }
+      coalesced.push(cur);
+    }
     const maxW=canvasW*.45, maxH=canvasH*.30;
-    const sorted=[...items].sort((a,b)=>(a.y-b.y)||(a.x-b.x));
+    const sorted=[...coalesced].sort((a,b)=>(a.y-b.y)||(a.x-b.x));
     const used=new Uint8Array(sorted.length);
     const blocks=[];
 
@@ -1271,10 +1308,124 @@ function initApp(){
   }
 
   function classifyAllGroups(groups,canvasWidth,canvasHeight){
-    return groups.map((group,index)=>{
+    const classified=groups.map((group,index)=>{
       const classification=classifyGroup(group,canvasWidth,canvasHeight,groups,index);
       return{...classification,group,zIndex:group.zIndex};
     });
+    // ── v4.2 Post-pass: merge clip-companion fill+stroke groups ──
+    // When a fill group and a stroke group share the same clip path, merge them
+    // into a single composite so containers render as filled shapes with borders.
+    function clipsMatch(a,b){
+      if(a.length!==b.length||a.length===0) return false;
+      for(let k=0;k<a.length;k++){
+        if(a[k].type!==b[k].type) return false;
+        if(a[k].coords.length!==b[k].coords.length) return false;
+        for(let c=0;c<a[k].coords.length;c++){
+          if(Math.abs(a[k].coords[c]-b[k].coords[c])>0.5) return false;
+        }
+      }
+      return true;
+    }
+    const merged=[];
+    let i=0;
+    while(i<classified.length){
+      const cur=classified[i];
+      if(i+1<classified.length){
+        const nxt=classified[i+1];
+        const curClips=cur.group.clips, nxtClips=nxt.group.clips;
+        const curTypes=new Set(cur.group.drawOps.map(d=>d.type));
+        const nxtTypes=new Set(nxt.group.drawOps.map(d=>d.type));
+        const isFillStroke=(curTypes.has('fill')&&nxtTypes.has('stroke'))||(curTypes.has('stroke')&&nxtTypes.has('fill'));
+        if(isFillStroke&&curClips.length>0&&clipsMatch(curClips,nxtClips)){
+          // Merge: combine drawOps, use the stroke group's z-index, union bounds
+          const mergedGroup={
+            opStart:Math.min(cur.group.opStart,nxt.group.opStart),
+            opEnd:Math.max(cur.group.opEnd,nxt.group.opEnd),
+            zIndex:cur.group.zIndex,
+            clips:cur.group.clips.slice(),
+            fillColor:cur.group.fillColor||nxt.group.fillColor,
+            strokeColor:cur.group.strokeColor||nxt.group.strokeColor,
+            graphicsState:cur.group.graphicsState,
+            drawOps:[...cur.group.drawOps,...nxt.group.drawOps],
+          };
+          const mergedBounds={
+            left:Math.min(cur.bounds?cur.bounds.left:0,nxt.bounds?nxt.bounds.left:0),
+            top:Math.min(cur.bounds?cur.bounds.top:0,nxt.bounds?nxt.bounds.top:0),
+            width:0,height:0,
+          };
+          const r=Math.max(cur.bounds?(cur.bounds.left+cur.bounds.width):0,nxt.bounds?(nxt.bounds.left+nxt.bounds.width):0);
+          const b=Math.max(cur.bounds?(cur.bounds.top+cur.bounds.height):0,nxt.bounds?(nxt.bounds.top+nxt.bounds.height):0);
+          mergedBounds.width=r-mergedBounds.left;
+          mergedBounds.height=b-mergedBounds.top;
+          merged.push({
+            layerType:LayerType.VECTOR_COMPOUND,
+            name:'Composite '+(cur.name||'')+' + '+(nxt.name||''),
+            bounds:mergedBounds,
+            needsRasterization:true,
+            group:mergedGroup,
+            zIndex:cur.group.zIndex,
+          });
+          i+=2; continue;
+        }
+      }
+      merged.push(cur);
+      i++;
+    }
+    // ── v4.2 Post-pass 2: spatial overlap merge for progress-bar-like widgets ──
+    // Thin fill-only raster groups whose bounds overlap by >70% are merged.
+    function boundsOverlap(a,b){
+      if(!a||!b) return 0;
+      const ox=Math.max(0,Math.min(a.left+a.width,b.left+b.width)-Math.max(a.left,b.left));
+      const oy=Math.max(0,Math.min(a.top+a.height,b.top+b.height)-Math.max(a.top,b.top));
+      const inter=ox*oy;
+      const smaller=Math.min(a.width*a.height,b.width*b.height);
+      return smaller>0?inter/smaller:0;
+    }
+    const final=[];
+    const used2=new Uint8Array(merged.length);
+    for(let j=0;j<merged.length;j++){
+      if(used2[j]) continue;
+      const cj=merged[j];
+      if(!cj.needsRasterization||!cj.bounds||cj.bounds.height>60){
+        final.push(cj); continue;
+      }
+      // Collect overlapping thin fill groups
+      const cluster=[j];
+      for(let k=j+1;k<merged.length;k++){
+        if(used2[k]) continue;
+        const ck=merged[k];
+        if(!ck.needsRasterization||!ck.bounds||ck.bounds.height>60) continue;
+        if(boundsOverlap(cj.bounds,ck.bounds)>0.7){
+          cluster.push(k); used2[k]=1;
+        }
+      }
+      if(cluster.length<2){ final.push(cj); continue; }
+      // Merge cluster into single composite
+      let mL=Infinity,mT=Infinity,mR=-Infinity,mB=-Infinity;
+      const allDrawOps=[], allClips=[];
+      let mZ=cj.zIndex;
+      for(const ci2 of cluster){
+        const cc=merged[ci2];
+        if(cc.bounds){
+          mL=Math.min(mL,cc.bounds.left); mT=Math.min(mT,cc.bounds.top);
+          mR=Math.max(mR,cc.bounds.left+cc.bounds.width); mB=Math.max(mB,cc.bounds.top+cc.bounds.height);
+        }
+        allDrawOps.push(...cc.group.drawOps);
+        if(cc.group.clips.length>allClips.length) allClips.splice(0,allClips.length,...cc.group.clips);
+        mZ=Math.min(mZ,cc.zIndex);
+      }
+      final.push({
+        layerType:LayerType.VECTOR_COMPOUND,
+        name:'Widget ('+Math.round(mR-mL)+'\u00d7'+Math.round(mB-mT)+')',
+        bounds:{left:mL,top:mT,width:mR-mL,height:mB-mT},
+        needsRasterization:true,
+        group:{opStart:0,opEnd:0,zIndex:mZ,clips:allClips,
+          fillColor:cj.group.fillColor,strokeColor:cj.group.strokeColor,
+          graphicsState:cj.group.graphicsState,drawOps:allDrawOps},
+        zIndex:mZ,
+      });
+    }
+    return final;
   }
 
   // ── Phase 3A: PSD Shape Layer Creation (Part B — native vector data) ──
@@ -1670,6 +1821,8 @@ function initApp(){
     // are already correct in page-space. Only color extraction is kept here.
     const textColors=[];
     let tcFillR=0, tcFillG=0, tcFillB=0;
+    let tcColorConsumedByVec=false; // v4.2: true if a fill/stroke used the current color
+    let tcLastTextR=0, tcLastTextG=0, tcLastTextB=0; // v4.2: last confirmed text color
     let tcInBlock=false, tcBlockHas=false;
     let tcBlockR=0, tcBlockG=0, tcBlockB=0;
 
@@ -1683,26 +1836,39 @@ function initApp(){
         tcFillR=Math.min(255,Math.round(args[0]*s));
         tcFillG=Math.min(255,Math.round(args[1]*s));
         tcFillB=Math.min(255,Math.round(args[2]*s));
+        tcColorConsumedByVec=false;
       }else if(fn===pdfjsLib.OPS.setFillGray){
         // gray: same 0-255 integer scale as RGB in PDF.js 3.x
         const s=args[0]>1?1:255;
         const gv=Math.min(255,Math.round(args[0]*s));
         tcFillR=gv; tcFillG=gv; tcFillB=gv;
+        tcColorConsumedByVec=false;
       }else if(fn===pdfjsLib.OPS.setFillCMYKColor){
         // Approximate CMYK→RGB for color extraction
         const c=args[0],m=args[1],y=args[2],k=args[3];
         tcFillR=Math.round(255*(1-c)*(1-k));
         tcFillG=Math.round(255*(1-m)*(1-k));
         tcFillB=Math.round(255*(1-y)*(1-k));
+        tcColorConsumedByVec=false;
+      }else if(fn===pdfjsLib.OPS.fill||fn===pdfjsLib.OPS.eoFill||fn===pdfjsLib.OPS.fillStroke||fn===pdfjsLib.OPS.eoFillStroke||fn===pdfjsLib.OPS.stroke){
+        // v4.2: vector draw consumed the current fill color
+        if(!tcInBlock) tcColorConsumedByVec=true;
       }else if(fn===pdfjsLib.OPS.beginText){
         tcInBlock=true; tcBlockHas=false;
-        // Capture fill color AT beginText (before any per-char setFont/color ops inside)
-        tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
+        // v4.2: If current color was consumed by a vector draw, fall back to last text color
+        if(tcColorConsumedByVec){
+          tcBlockR=tcLastTextR; tcBlockG=tcLastTextG; tcBlockB=tcLastTextB;
+        }else{
+          tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
+        }
       }else if(fn===pdfjsLib.OPS.showText||fn===pdfjsLib.OPS.showSpacedText){
         if(tcInBlock){
           tcBlockHas=true;
-          // Update with the most recent fill color at the time of actual drawing
-          tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
+          // v4.2: Use most recent fill color only if not consumed by vector draw
+          if(!tcColorConsumedByVec){
+            tcBlockR=tcFillR; tcBlockG=tcFillG; tcBlockB=tcFillB;
+          }
+          tcLastTextR=tcBlockR; tcLastTextG=tcBlockG; tcLastTextB=tcBlockB;
         }
       }else if(fn===pdfjsLib.OPS.endText){
         if(tcBlockHas){
@@ -2155,7 +2321,7 @@ function initApp(){
         };
 
         // ── Debug: PSD assembly ──
-        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.1 — unified z-order, solid bg) ──`,'dbg-section');
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.2 — unified z-order, solid bg, text merge, color scoping) ──`,'dbg-section');
         dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
         dbg(`  Layers: ${textLayers.length} text + ${vecLayers.length} vector (${shapeCount} shape + ${rasterCount} raster) + ${imgLayers.length} image + 1 bg = ${psd.children.length} total`);
         dbg(`  Layer stack (top→bottom in Photoshop):`);

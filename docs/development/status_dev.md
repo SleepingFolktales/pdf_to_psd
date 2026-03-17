@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v4.1 (Four-Phase Pipeline with Refinements — Z-Order Fix, Solid Background, VectorMask Normalization, Per-Text Z-Index)
+## Current Version: v4.2 (Resume PDF Refinements — Text Merge, Color Scoping, Clip-Companion Compositing, Widget Merge)
 
 ---
 
@@ -181,6 +181,15 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 ---
 
 ## What We Did (Changelog)
+
+### v4.2 — Resume PDF Refinements (5 Systemic Failures from Complex Resume Test)
+- **Issue 4 — Text Fragmentation P0**: Added same-line word coalescing pre-pass in `mergeBlocks()`. Before the spatial paragraph merge, items are sorted by Y then X and consecutive items sharing the same line (within 2px Y), font, fontSize (within 0.5pt), color, and rotation are merged. Inserts spaces between words when gap exceeds 15% of average character width. Respects color breaks — different-colored runs on the same line become separate layers. This reduces per-word atomization of justified text from ~74 to ~35-40 text layers
+- **Issue 5 — Wrong Text Color P1**: Scoped `setFillRGBColor` tracking to `beginText`/`endText` blocks. Added `tcColorConsumedByVec` flag — when a `fill`/`stroke`/`fillStroke` vector draw op consumes the current fill color outside a text block, the color is marked as consumed. On `beginText`, if the color was consumed by a vector draw, falls back to the last confirmed text color (`tcLastTextR/G/B`) instead of the polluted vector fill. Fixes invisible text like T53 "Video and photo editing" which was picking up background rect color `rgb(240,239,239)`
+- **Issues 1 & 3 — Missing Filled Backgrounds P1**: Added clip-companion fill+stroke merge post-pass in `classifyAllGroups()`. After initial classification, adjacent groups sharing the same clip path (matched by type + coords within 0.5 tolerance) where one has fill ops and the other has stroke ops are merged into a single `VECTOR_COMPOUND` group with combined drawOps and unioned bounds. Fixes hollow pill/capsule containers for contact strips and section headers
+- **Issue 2 — Progress Bar Decomposition P1**: Added spatial overlap merge post-pass in `classifyAllGroups()`. After clip-companion merge, thin raster groups (height ≤ 60px) whose bounds overlap by >70% of the smaller area are clustered and merged into single `Widget` composite layers. Fixes decomposed progress bar track+fill fragments
+- **Version header**: Updated to v4.2
+- **Debug labels**: Assembly section now labeled "v4.2 — unified z-order, solid bg, text merge, color scoping"
+- **Duplicate title tag**: Removed stale v4.1 `<title>` duplicate
 
 ### v4.1 — Post-v4.0 Refinements (6 Issues from Postmortem)
 - **Issue 1 — Z-Order Inverted (Critical)**: Removed `.reverse()` call in PSD assembly. ag-psd `children[0]` = bottommost layer (painted first). Ascending z-order sort is now used directly without inversion. Background inserted at index 0 via `unshift()` instead of `push()`
