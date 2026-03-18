@@ -19,32 +19,67 @@ A fully client-side, single-HTML-file converter that transforms PDFs into layere
 
 ## How It Works
 
-### v2 Pipeline: Pristine-First Extraction
+### v4.6 Four-Phase Pipeline: Operator-Driven Segmentation + Shape Layers
 
-The key insight: extract everything from the **unmodified** canvas first, then cut.
+The v4 architecture fundamentally restructures PDF processing around the **operator list** (the PDF drawing commands) rather than just text/image extraction. This enables native PSD Shape Layers for vector graphics and precise per-draw-op transformation tracking.
 
 ```
 PDF File
   ↓
-1. RENDER        — Full-page raster at target DPI (pristine canvas)
+0. RENDER & EXTRACT
+   ├─ page.render() → pristine canvas at target DPI
+   ├─ page.getTextContent() → text items with position/font/size
+   ├─ page.getOperatorList() → raw PDF drawing commands
+   └─ extractPageImages() → walk operator list, track CTM, extract images + text colors
   ↓
-2. EXTRACT TEXT  — page.getTextContent() → position, font, size per item
-                   Rotation detection via viewport × item.transform
+1. SEGMENTATION (Phase 1)
+   ├─ Parse operator list: save/restore/transform/fill/stroke/image/text
+   ├─ Track Current Transformation Matrix (CTM) at every depth
+   ├─ Snapshot ctmAtDraw for each draw operation
+   ├─ Split at depth-3 boundaries → sub-groups
+   └─ Result: operator groups with full CTM context
   ↓
-3. SAMPLE COLORS — From the pristine canvas (before any modification)
-                   Most-common non-white pixel in each text item's bbox
+2. CLASSIFICATION (Phase 2)
+   ├─ Analyze each group: draw ops, clips, bounds, coverage
+   ├─ Classify as: IMAGE | TEXT | VECTOR_FILL | VECTOR_STROKE | VECTOR_COMPOUND | BACKGROUND_FILL
+   ├─ Merge clip-companion fill+stroke groups (same clip path)
+   ├─ Merge overlapping thin fill groups (progress bars, widgets)
+   └─ Result: classified groups with layer type + bounds
   ↓
-4. EXTRACT IMAGES — Walk page.getOperatorList(), track CTM through
-                    save/restore/transform. Copy each image bbox from
-                    the CLEAN canvas into its own layer.
+3. VECTOR RENDERING (Phase 3)
+   ├─ For each group needing rasterization:
+   │  ├─ 3A: Try shape layer (native PSD vectorMask)
+   │  │      ├─ Convert PDF paths → PSD knots (Bezier curves)
+   │  │      ├─ Apply per-draw-op CTM transformation
+   │  │      ├─ Handle clips as fallback masks
+   │  │      └─ Result: vectorMask + vectorFill/vectorStroke
+   │  └─ 3B: Fallback to rasterization (canvas replay)
+   │         ├─ Replay draw ops with per-op CTM
+   │         ├─ Apply clip regions
+   │         └─ Result: pixel layer
+   ├─ Extract images with circular/curved clip masks → vectorMask on image layers
+   └─ Result: shape layers + rasterized layers
   ↓
-5. CLEAN BACKGROUND — clearRect text + image regions → transparent holes
-                      TypeLayers and image layers fill the gaps in the PSD
+4. TEXT ASSEMBLY (Phase 4)
+   ├─ Extract text items from getTextContent()
+   ├─ Apply position-correlated color matching from operator list
+   ├─ Merge adjacent items into logical blocks:
+   │  ├─ Same-line coalescing (word fragments → words)
+   │  ├─ Paragraph grouping (same font/size/color/rotation)
+   │  ├─ Guards: baseline step ≤ 2× fontSize, no heading interleave
+   │  └─ Section boundary detection (thin vector lines)
+   ├─ Render each block to canvas with TypeLayer metadata
+   └─ Result: editable text layers
   ↓
-6. MERGE TEXT    — Group adjacent items into fewer TypeLayers (optional)
+5. UNIFIED Z-ORDER ASSEMBLY
+   ├─ Collect all layers: text + vector (shape + raster) + image
+   ├─ Sort by z-index (paint order from operator list)
+   ├─ Clean background: clearRect text + image + vector regions
+   ├─ Add solid background layer (sampled from page)
+   └─ Result: final layer stack
   ↓
-7. ASSEMBLE PSD  — Layer stack (top → bottom in Photoshop):
-                     TypeLayers → Image layers → Background
+6. PSD WRITE
+   └─ ag-psd.writePsd() → binary PSD file
   ↓
 PSD File (ready to download)
 ```

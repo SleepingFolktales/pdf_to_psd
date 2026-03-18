@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v4.5 (VectorMask [x,y] Order Fix, Position-Correlated Text Colors, Font Name Hardening)
+## Current Version: v4.6 (Rect Clip-Fallback Fix, Line Rasterization, Circular Image Clip, Merge Gap/Interleave Guards, Stroke-Only Fill Fix)
 
 ---
 
@@ -181,6 +181,16 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 ---
 
 ## What We Did (Changelog)
+
+### v4.6 — Rect Clip-Fallback Fix, Line Rasterization, Circular Image Clip, Merge Gap/Interleave Guards, Stroke-Only Fill Fix
+- **P1 Rectangle Clip-Fallback Fix (Critical)**: In `createShapeLayer()`, pure-rectangle draw ops now always use their own CTM-transformed geometry. Previously, a rect group inside a curved parent clip (e.g., small gold dots 19×19) would fall back to using the curved clip as the vectorMask, inflating bounds to the full canvas (1029×1433). Fix: after the `useCurvedClipFallback` check, if all draw-op paths are exclusively `rectangle`/`closePath` ops, `useCurvedClipFallback` is reset to `false`.
+- **P2 Line Path Rasterization (Critical)**: `shouldUseShapeLayer()` now rejects 2-point stroke-only paths (moveTo+lineTo only, no curves or rects). Straight lines can't form closed vectorMask fills and would degenerate. Separator lines (horizontal/vertical) are now routed to rasterization fallback.
+- **P3 Image Circular Clip Mask (High)**: When building `imgLayers`, each image layer now checks its matching classified group for curved clip paths. If a curved clip exists (e.g., the circular mask on a profile photo), `pdfPathToPsdVectorMask()` converts it to a `vectorMask` attached to the `imgLayer`. Gives true circular masking in Photoshop instead of a rectangular crop.
+- **P4 Merge Gap Threshold (High)**: `mergeBlocks()` tracks `mxBy` (max baseline Y seen in the group). For `nextLine` candidates, the consecutive baseline step `byStep = it.by - mxBy` must be ≤ `seed.fontSize * 2.0`. Prevents five isolated percentage values (~74px step, ~34px font) from merging into one vertical block.
+- **P5 Heading-Interleave Guard (Medium)**: For `nextLine` merges where the candidate baseline is above `mxBy`, `mergeBlocks()` scans for any unmerged item with a different `fontName` whose baseline falls in the Y gap between `mxBy` and `it.by` and whose X range overlaps the current group. If found, the merge is rejected. Prevents experience body text from two jobs merging across the "Digital Marketing Manager" heading.
+- **P6 Stroke-Only Shape Fill Fix (Medium)**: `createShapeLayer()` now tracks `isStrokeOnly` and `syntheticFill`. For stroke-only groups without a synthesized background fill (i.e., not sidebar containers), `vectorFill` is omitted from the layer and `vectorStroke.fillEnabled` is set to `false`. Outlines ("About Me", "Experience", tab shapes) now render as true outlines with transparent interiors instead of white-filled shapes.
+- **Version header**: Updated to v4.6
+- **Debug labels**: Assembly section labeled "v4.6 — rect clip fix, line rasterize, img vectorMask, merge gap guard, stroke-only fill"
 
 ### v4.5 — VectorMask [x,y] Order Fix, Position-Correlated Text Colors, Font Name Hardening
 - **VectorMask Coordinate Order Revert (Critical P0)**: Reverted knot point ordering in `pdfPathToPsdVectorMask()` from `[y,x]` back to `[x,y]`. V4.4 incorrectly swapped to `[y,x]` based on a misread of ag-psd's API — the library expects `[x,y]` and handles the PSD binary `[y,x]` encoding internally. Applied to `straightKnot()` and all `curveTo`/`curveTo2`/`curveTo3` handlers. Fixes: all shape layers transposed (top↔left swapped), small rects expanding to full-canvas bounds, decorative shapes mispositioned

@@ -1,11 +1,11 @@
-<!-- PDF → PSD Converter v4.5 -->
-<!-- Four-phase pipeline with v4.5: vectorMask [x,y] order fix, position-correlated text colors, font name hardening -->
+<!-- PDF → PSD Converter v4.6 -->
+<!-- Four-phase pipeline with v4.6: rect CTM clip-fallback fix, line rasterization, circular img clip, merge gap/interleave guards, stroke-only fill fix -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v4.5</title>
+<title>PDF → PSD Converter v4.6</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -710,6 +710,7 @@ function initApp(){
       const group=[i]; used[i]=1;
       let mnX=seed.x, mnY=seed.y, mxX=seed.x+seed.width, mxY=seed.y+seed.height;
       const fh=seed.height; // seed font height — thresholds based on this
+      let mxBy=seed.by; // v4.6 P4: track max baseline for consecutive step guard
 
       let changed=true;
       while(changed){
@@ -742,9 +743,30 @@ function initApp(){
           const newMnY=Math.min(mnY,it.y), newMxY=Math.max(mxY,it.y+it.height);
           const newMnX=Math.min(mnX,it.x), newMxX=Math.max(mxX,it.x+it.width);
           if(crossesBoundary(newMnY,newMxY,newMnX,newMxX)) continue;
+          // ⑨ v4.6 P4: consecutive baseline step ≤ 2× fontSize prevents wide-gap merges
+          //    e.g., five isolated percentage values ~74px apart must not become one block
+          if(nextLine){
+            const byStep=it.by-mxBy;
+            if(byStep>seed.fontSize*2.0) continue;
+          }
+          // ⑩ v4.6 P5: heading-interleave guard — don't merge body text across a heading
+          //    If a different-font item lies in the Y gap between group bottom and candidate, reject
+          if(nextLine&&it.by>mxBy){
+            let headingInGap=false;
+            for(let hk=0;hk<sorted.length;hk++){
+              if(used[hk]) continue;
+              const hd=sorted[hk];
+              if(hd.fontName===seed.fontName) continue;
+              if(hd.by<=mxBy||hd.by>=it.by) continue;
+              if(hd.bx>=mxX||hd.bx+hd.width<=mnX) continue;
+              headingInGap=true; break;
+            }
+            if(headingInGap) continue;
+          }
           group.push(j); used[j]=1;
           mnX=newMnX; mnY=newMnY;
           mxX=newMxX; mxY=newMxY;
+          if(it.by>mxBy) mxBy=it.by; // v4.6 P4: advance max baseline
           changed=true;
         }
       }
@@ -1601,6 +1623,22 @@ function initApp(){
         hasNonVectorOp=true;
       }
     }
+    // v4.6 P2: 2-point stroke-only paths (moveTo+lineTo only) → rasterize.
+    // A straight line can't form a closed vectorMask fill — it degenerates to nothing.
+    if(hasValidColor&&!hasNonVectorOp){
+      const allStroke=group.drawOps.every(d=>d.type==='stroke');
+      if(allStroke){
+        const isLine=group.drawOps.every(dop=>{
+          if(!dop.pathData) return false;
+          const{ops}=dop.pathData;
+          const hasCurveOrRect=ops.some(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3||op===PATH_OPS.rectangle);
+          if(hasCurveOrRect) return false;
+          const ptCount=ops.filter(op=>op===PATH_OPS.moveTo||op===PATH_OPS.lineTo).length;
+          return ptCount<=2;
+        });
+        if(isLine) return false;
+      }
+    }
     return hasValidColor&&!hasNonVectorOp;
   }
 
@@ -1638,6 +1676,15 @@ function initApp(){
           }
         }
       }
+      // v4.6 P1: Rectangle-only draw ops always use their own CTM-transformed geometry.
+      // Pure-rect draws inside curved parent clips (e.g., small gold dots) must NOT fall
+      // back to the clip path, which expands vectorMask to the full parent clip bounds.
+      if(useCurvedClipFallback){
+        const drawOpsAreRectOnly=group.drawOps.every(dop=>
+          dop.pathData&&dop.pathData.ops.every(op=>op===PATH_OPS.rectangle||op===PATH_OPS.closePath)
+        );
+        if(drawOpsAreRectOnly) useCurvedClipFallback=false;
+      }
       if(useCurvedClipFallback){
         // Progress bar case: clip is rounded-rect pill, draw-op is plain rect fill
         for(const clip of group.clips){
@@ -1663,17 +1710,20 @@ function initApp(){
     const vectorMask={paths:allPaths};
 
     // Build fill descriptor
+    const isStrokeOnly=group.drawOps.every(d=>d.type==='stroke');
     let fillColor=null;
     for(const dop of group.drawOps){
       if((dop.type==='fill'||dop.type==='fillStroke')&&dop.fillColor){fillColor=dop.fillColor;break;}
     }
     // v4.3: For stroke-only groups (sidebar containers), synthesize fill from bg color
+    let syntheticFill=false;
     if(!fillColor&&bgColor){
-      const hasOnlyStrokes=group.drawOps.every(d=>d.type==='stroke');
-      if(hasOnlyStrokes&&group.clips.length>0) fillColor=bgColor;
+      if(isStrokeOnly&&group.clips.length>0){fillColor=bgColor;syntheticFill=true;}
     }
     if(!fillColor) fillColor=group.fillColor||group.strokeColor||{r:0,g:0,b:0};
     const vectorFill={type:'color',color:{r:fillColor.r,g:fillColor.g,b:fillColor.b}};
+    // v4.6 P6: stroke-only groups without synthesized bg fill → transparent interior (no vectorFill)
+    const useFill=!isStrokeOnly||syntheticFill;
 
     // Build stroke descriptor — check ALL draw ops for strokes
     let vectorStroke=null;
@@ -1688,7 +1738,7 @@ function initApp(){
           const gs2=dop.gStateAtDraw||group.graphicsState||{};
           vectorStroke={
             strokeEnabled:true,
-            fillEnabled:true,
+            fillEnabled:useFill,
             lineWidth:{value:pixelLW,units:'Points'},
             lineCapType:['butt','round','square'][gs2.lineCap||0]||'butt',
             lineJoinType:['miter','round','bevel'][gs2.lineJoin||0]||'miter',
@@ -1710,11 +1760,11 @@ function initApp(){
       top:bounds.top, left:bounds.left,
       bottom:bounds.top+bounds.height, right:bounds.left+bounds.width,
       vectorMask:vectorMask,
-      vectorFill:vectorFill,
       canvas:previewCanvas,
       blendMode:gs.blendMode||'normal',
       opacity:typeof gs.opacity==='number'?Math.round(gs.opacity*255):255,
     };
+    if(useFill) layer.vectorFill=vectorFill; // v4.6 P6: only for non-stroke-only shapes
     // Only add vectorStroke if non-null — ag-psd crashes on null .type
     if(vectorStroke) layer.vectorStroke=vectorStroke;
     return layer;
@@ -2302,13 +2352,24 @@ function initApp(){
           // Tag with z-index from matching classified image group
           const matchCg=imageGroups.find(ig=>ig.name===img.name);
           const imgZ=matchCg?matchCg.zIndex:(1000+k);
-          imgLayers.push({name:'IMG '+(k+1)+' ('+cw+'×'+ch+')',top:ct,left:cl,bottom:cb,right:cr,canvas:c,_zIndex:imgZ});
+          const imgLayer={name:'IMG '+(k+1)+' ('+cw+'×'+ch+')',top:ct,left:cl,bottom:cb,right:cr,canvas:c,_zIndex:imgZ};
+          // v4.6 P3: Apply circular/curved clip as vectorMask (e.g., circular profile photo)
+          if(matchCg&&matchCg.group.clips.length>0){
+            for(const clip of matchCg.group.clips){
+              if(clip.ops&&clip.ops.some(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3)){
+                const clipMask=pdfPathToPsdVectorMask({ops:clip.ops,coords:clip.coords},clip.clipTransform||[1,0,0,1,0,0],bgCanvas.width,bgCanvas.height);
+                if(clipMask.paths.length>0) imgLayer.vectorMask=clipMask;
+                break;
+              }
+            }
+          }
+          imgLayers.push(imgLayer);
         }
         dbg(`── PAGE ${pageNum} IMAGE LAYERS ──`,'dbg-section');
         dbg(`  Extracted: ${imgLayers.length} image layer(s)`,(imgLayers.length?'dbg-ok':'dbg-warn'));
         for(const il of imgLayers) dbg(`  z=${il._zIndex} "${il.name}" top=${il.top} left=${il.left}`,'dbg-img');
 
-        // ── 6. Merge into TypeLayer blocks ──
+        // ── 6. Merge into TypeLayer blocks ──────────────────────────────────────────
         // v4.4: Extract section boundaries from thin vector stroke lines (dividers)
         const sectionBoundaries=[];
         for(const cg of classified){
@@ -2423,7 +2484,7 @@ function initApp(){
         };
 
         // ── Debug: PSD assembly ──
-        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.5 — [x,y] vectorMask, position-correlated colors, font hardening) ──`,'dbg-section');
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.6 — rect clip fix, line rasterize, img vectorMask, merge gap guard, stroke-only fill) ──`,'dbg-section');
         dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
         dbg(`  Layers: ${textLayers.length} text + ${vecLayers.length} vector (${shapeCount} shape + ${rasterCount} raster) + ${imgLayers.length} image + 1 bg = ${psd.children.length} total`);
         dbg(`  Layer stack (top→bottom in Photoshop):`);
