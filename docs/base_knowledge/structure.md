@@ -84,7 +84,7 @@ and each draw op (fill/stroke/image/text) snapshots `ctmAtDraw`.
 
 ---
 
-## v4 Architecture: Four-Phase Pipeline (updated v4.6)
+## v4 Architecture: Four-Phase Pipeline (updated v4.7)
 
 The v4 pipeline fundamentally restructures PDF processing around the **operator list** (raw PDF drawing commands) rather than just text/image extraction. This enables:
 - **Native PSD Shape Layers** with vectorMask (Bezier curves) instead of rasterized pixels
@@ -95,6 +95,7 @@ The v4 pipeline fundamentally restructures PDF processing around the **operator 
 
 v4.5 reverts vectorMask knot ordering back to `[x,y]` (ag-psd API convention), replaces index-based text color mapping with position-correlated spatial matching, and hardens font name resolution.
 v4.6 adds rect clip-fallback fix, line rasterization, circular image clip masks, merge gap/interleave guards, and stroke-only fill fixes.
+v4.7 adds stroke lineWidth clamping (min 1.5px), multi-subpath pattern rasterization, transparent stroke outlines, progress bar rasterization, circular clip dot masks, center-alignment detection, and fakeBold fallback.
 
 ### Transform chain: `pixelCoord = viewportTransform × pageTransform × elementTransform × localCoord`
 

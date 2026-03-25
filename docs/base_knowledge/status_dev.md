@@ -1,6 +1,6 @@
 # PDF → PSD Converter — Dev Status
 
-## Current Version: v4.6 (Rect Clip-Fallback Fix, Line Rasterization, Circular Image Clip, Merge Gap/Interleave Guards, Stroke-Only Fill Fix)
+## Current Version: v4.7 (Stroke LineWidth Clamp, Polygon Rasterization, Transparent Stroke Fill, Progress Bar Rasterize, Circular Dot Mask, Center Alignment, FakeBold)
 
 ---
 
@@ -181,6 +181,16 @@ When user hides Background layer, text disappears entirely because TypeLayers re
 ---
 
 ## What We Did (Changelog)
+
+### v4.7 — Stroke LineWidth Clamp, Polygon Rasterization, Transparent Stroke Fill, Progress Bar Rasterize, Circular Dot Mask, Center Alignment, FakeBold
+- **RC1 Stroke LineWidth Clamp (Critical)**: In `rasterizeForPreview()`, `ctx.lineWidth` is now `Math.max(rawLW, 1.5/ctmScale)`. Guarantees ≥1.5 rendered canvas pixels for thin strokes when the CTM scale is very small. Horizontal/vertical separator lines now always appear.
+- **RC2 Multi-Sub-Path Pattern Rasterization (High)**: `shouldUseShapeLayer()` rejects paths with >10 `moveTo` ops and no curves. Decorative grids/diamond patterns now rasterize to canvas instead of collapsing into a degenerate single vectorMask.
+- **RC3 Transparent Stroke Fill (High)**: `syntheticFill` removed from `createShapeLayer()`. Stroke-only shapes (rounded headers, tab outlines) no longer receive a synthesized background color — they render as true transparent-interior outlines.
+- **RC4 Progress Bar Multi-Color Rasterization (High)**: `shouldUseShapeLayer()` rejects fill groups with ≥2 fills of different colors. Dual-tone progress bars (gray + gold) now rasterize in draw order, preserving both colors.
+- **RC7 Circular Clip VectorMask for Dots (Medium)**: v4.6 P1 rect-fallback refined — curved clips with 4–8 curveTo ops (bezier circle) are kept as the vectorMask. Gold bullet dots now render as circles, not squares.
+- **RC6 Center-Alignment Detection (Medium)**: `mergeBlocks()` measures per-line midpoint X spread. Spread <8px → `alignment='center'`. TypeLayer `style` gains `justification:'center'` for centered blocks.
+- **RC6b FakeBold Fallback (Low)**: TypeLayer `style` gains `fakeBold:true` when the resolved PostScript font name contains "Bold".
+- **Version header**: Updated to v4.7
 
 ### v4.6 — Rect Clip-Fallback Fix, Line Rasterization, Circular Image Clip, Merge Gap/Interleave Guards, Stroke-Only Fill Fix
 - **P1 Rectangle Clip-Fallback Fix (Critical)**: In `createShapeLayer()`, pure-rectangle draw ops now always use their own CTM-transformed geometry. Previously, a rect group inside a curved parent clip (e.g., small gold dots 19×19) would fall back to using the curved clip as the vectorMask, inflating bounds to the full canvas (1029×1433). Fix: after the `useCurvedClipFallback` check, if all draw-op paths are exclusively `rectangle`/`closePath` ops, `useCurvedClipFallback` is reset to `false`.

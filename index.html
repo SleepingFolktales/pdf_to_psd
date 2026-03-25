@@ -1,11 +1,11 @@
-<!-- PDF → PSD Converter v4.6 -->
-<!-- Four-phase pipeline with v4.6: rect CTM clip-fallback fix, line rasterization, circular img clip, merge gap/interleave guards, stroke-only fill fix -->
+<!-- PDF → PSD Converter v4.7 -->
+<!-- Four-phase pipeline with v4.7: stroke lineWidth clamp, multi-subpath rasterize, stroke-only transparent fill, multi-color fill rasterize, circular clip dot, center-alignment, fakeBold -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → PSD Converter v4.6</title>
+<title>PDF → PSD Converter v4.7</title>
 <style>
 :root {
   --bg0:#0b0b0d; --bg1:#111114; --bg2:#18181c; --bg3:#202026; --bg4:#2a2a32;
@@ -782,7 +782,28 @@ function initApp(){
       }
       tWidth=Math.max(tWidth,gItems[gItems.length-1].bx+gItems[gItems.length-1].width-gItems[0].bx);
 
-      blocks.push({ text, bx:gItems[0].bx, by:gItems[0].by, tWidth, fontName:gItems[0].fontName, fontSize:gItems[0].fontSize, color:gItems[0].color, isRotated:gItems[0].isRotated, cosA:gItems[0].cosA, sinA:gItems[0].sinA });
+      // v4.7 RC6: detect center-alignment from line midpoint variance.
+      // Multiple lines with the same center X → centred paragraph.
+      let blockAlignment='left';
+      if(gItems.length>=2){
+        const yMap=new Map();
+        for(const it of gItems){
+          const yk=Math.round(it.y/2)*2;
+          if(!yMap.has(yk)) yMap.set(yk,[]);
+          yMap.get(yk).push(it);
+        }
+        const lineArr=[...yMap.values()];
+        if(lineArr.length>=2){
+          const mids=lineArr.map(line=>{
+            const lx=Math.min(...line.map(it=>it.bx));
+            const rx=Math.max(...line.map(it=>it.bx+it.width));
+            return(lx+rx)/2;
+          });
+          const spread=Math.max(...mids)-Math.min(...mids);
+          if(spread<8) blockAlignment='center';
+        }
+      }
+      blocks.push({ text, bx:gItems[0].bx, by:gItems[0].by, tWidth, fontName:gItems[0].fontName, fontSize:gItems[0].fontSize, color:gItems[0].color, isRotated:gItems[0].isRotated, cosA:gItems[0].cosA, sinA:gItems[0].sinA, alignment:blockAlignment });
     }
     return blocks;
   }
@@ -1639,6 +1660,26 @@ function initApp(){
         if(isLine) return false;
       }
     }
+    if(hasValidColor&&!hasNonVectorOp){
+      // v4.7 RC2: complex multi-sub-path patterns (>10 moveTo, no curves) → rasterize.
+      // Decorative grids/diamond patterns have many sub-paths and look wrong as a single vectorMask.
+      for(const dop of group.drawOps){
+        if(!dop.pathData) continue;
+        const{ops}=dop.pathData;
+        const subPathCount=ops.filter(op=>op===PATH_OPS.moveTo).length;
+        const hasAnyCurve=ops.some(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3);
+        if(subPathCount>10&&!hasAnyCurve) return false;
+      }
+      // v4.7 RC4: multi-fill groups with different colors → rasterize (progress bars).
+      // Two fills (gray background + gold foreground) must render in sequence on canvas,
+      // not collapse into a single vectorFill color.
+      const fillOps=group.drawOps.filter(d=>(d.type==='fill'||d.type==='fillStroke')&&d.fillColor);
+      if(fillOps.length>=2){
+        const c0=fillOps[0].fillColor;
+        if(fillOps.slice(1).some(f=>f.fillColor.r!==c0.r||f.fillColor.g!==c0.g||f.fillColor.b!==c0.b))
+          return false;
+      }
+    }
     return hasValidColor&&!hasNonVectorOp;
   }
 
@@ -1683,7 +1724,16 @@ function initApp(){
         const drawOpsAreRectOnly=group.drawOps.every(dop=>
           dop.pathData&&dop.pathData.ops.every(op=>op===PATH_OPS.rectangle||op===PATH_OPS.closePath)
         );
-        if(drawOpsAreRectOnly) useCurvedClipFallback=false;
+        if(drawOpsAreRectOnly){
+          // v4.7 RC7: check if any clip is a small bezier circle (4–8 curveTo ops)
+          const hasCircularClip=group.clips.some(clip=>{
+            if(!clip.ops) return false;
+            const cc=clip.ops.filter(op=>op===PATH_OPS.curveTo||op===PATH_OPS.curveTo2||op===PATH_OPS.curveTo3).length;
+            return cc>=4&&cc<=8;
+          });
+          // Only revert to draw-op rect when the clip is NOT a circle
+          if(!hasCircularClip) useCurvedClipFallback=false;
+        }
       }
       if(useCurvedClipFallback){
         // Progress bar case: clip is rounded-rect pill, draw-op is plain rect fill
@@ -1715,11 +1765,9 @@ function initApp(){
     for(const dop of group.drawOps){
       if((dop.type==='fill'||dop.type==='fillStroke')&&dop.fillColor){fillColor=dop.fillColor;break;}
     }
-    // v4.3: For stroke-only groups (sidebar containers), synthesize fill from bg color
-    let syntheticFill=false;
-    if(!fillColor&&bgColor){
-      if(isStrokeOnly&&group.clips.length>0){fillColor=bgColor;syntheticFill=true;}
-    }
+    // v4.7 RC3: stroke-only shapes (headers, tabs, outlines) must have transparent interior.
+    // Removed syntheticFill — setting bg color on outline shapes caused white-filled boxes.
+    const syntheticFill=false;
     if(!fillColor) fillColor=group.fillColor||group.strokeColor||{r:0,g:0,b:0};
     const vectorFill={type:'color',color:{r:fillColor.r,g:fillColor.g,b:fillColor.b}};
     // v4.6 P6: stroke-only groups without synthesized bg fill → transparent interior (no vectorFill)
@@ -1834,7 +1882,13 @@ function initApp(){
 
       const gs=drawOp.gStateAtDraw||group.graphicsState||{};
       ctx.globalAlpha=typeof gs.opacity==='number'?gs.opacity:1;
-      ctx.lineWidth=drawOp.lineWidth||gs.lineWidth||1;
+      // v4.7 RC1: guarantee stroke is at least 1.5 canvas px wide.
+      // With ctx.setTransform applied, lineWidth is in user-space units scaled by CTM.
+      // A very small CTM scale can make lineWidth*scale < 1px → invisible stroke.
+      // Clamp so rendered width = max(rawLW, 1.5/ctmScale) * ctmScale ≥ 1.5px.
+      const rawLW=drawOp.lineWidth||gs.lineWidth||1;
+      const ctmScaleLW=Math.sqrt(t[0]*t[0]+t[1]*t[1])||1;
+      ctx.lineWidth=Math.max(rawLW,1.5/ctmScaleLW);
       ctx.lineCap=['butt','round','square'][drawOp.lineCap||gs.lineCap||0]||'butt';
       ctx.lineJoin=['miter','round','bevel'][drawOp.lineJoin||gs.lineJoin||0]||'miter';
       ctx.miterLimit=drawOp.miterLimit||gs.miterLimit||10;
@@ -2434,7 +2488,11 @@ function initApp(){
               transform: b.isRotated
                 ? [b.cosA, b.sinA, -b.sinA, b.cosA, b.bx, b.by]
                 : [1,0,0,1,b.bx,b.by],
-              style:{ font:{name:b.fontName}, fontSize:fs, fillColor:b.color },
+              // v4.7 RC6b: fakeBold when PostScript name contains Bold (faux bold if font not installed)
+              style:{ font:{name:b.fontName}, fontSize:fs, fillColor:b.color,
+                ...(/bold/i.test(b.fontName)?{fakeBold:true}:{}),
+                ...(b.alignment==='center'?{justification:'center'}:{}),
+              },
             },
             _zIndex:textZ+idx*0.001,
           };
@@ -2484,7 +2542,7 @@ function initApp(){
         };
 
         // ── Debug: PSD assembly ──
-        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.6 — rect clip fix, line rasterize, img vectorMask, merge gap guard, stroke-only fill) ──`,'dbg-section');
+        dbg(`── PAGE ${pageNum} PSD ASSEMBLY (v4.7 — stroke lineWidth clamp, polygon rasterize, transparent stroke fill, progress bar rasterize, circular dot, center align, fakeBold) ──`,'dbg-section');
         dbg(`  Canvas: ${bgCanvas.width}×${bgCanvas.height}`);
         dbg(`  Layers: ${textLayers.length} text + ${vecLayers.length} vector (${shapeCount} shape + ${rasterCount} raster) + ${imgLayers.length} image + 1 bg = ${psd.children.length} total`);
         dbg(`  Layer stack (top→bottom in Photoshop):`);
